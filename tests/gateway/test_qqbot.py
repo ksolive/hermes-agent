@@ -2507,3 +2507,247 @@ class TestGroupSharedSession:
         key = build_session_key(self._source(), group_sessions_per_user=False)
         assert "member_openid_1" not in key
         assert key.endswith(":group_openid_1")
+
+
+# ---------------------------------------------------------------------------
+# Group context buffer (2.2.1) — GroupContextBuffer unit tests
+# ---------------------------------------------------------------------------
+
+class TestGroupContextBuffer:
+    def _buf(self, **kw):
+        from gateway.platforms.qqbot.group_context import GroupContextBuffer
+        return GroupContextBuffer(**kw)
+
+    def test_record_and_drain_in_order(self):
+        buf = self._buf(limit=10)
+        buf.record("g1", sender="u1", text="first")
+        buf.record("g1", sender="u2", text="second")
+        entries = buf.drain("g1")
+        assert [e.text for e in entries] == ["first", "second"]
+        assert [e.sender for e in entries] == ["u1", "u2"]
+
+    def test_drain_clears(self):
+        buf = self._buf(limit=10)
+        buf.record("g1", sender="u1", text="hi")
+        assert buf.drain("g1")
+        assert buf.drain("g1") == []
+
+    def test_limit_truncates_oldest(self):
+        buf = self._buf(limit=2)
+        buf.record("g1", sender="u", text="a")
+        buf.record("g1", sender="u", text="b")
+        buf.record("g1", sender="u", text="c")
+        entries = buf.drain("g1")
+        assert [e.text for e in entries] == ["b", "c"]  # oldest "a" dropped
+
+    def test_disabled_when_limit_zero(self):
+        buf = self._buf(limit=0)
+        assert buf.enabled is False
+        buf.record("g1", sender="u", text="hi")
+        assert buf.drain("g1") == []
+
+    def test_group_isolation(self):
+        buf = self._buf(limit=10)
+        buf.record("g1", sender="u", text="a")
+        buf.record("g2", sender="u", text="b")
+        assert [e.text for e in buf.drain("g1")] == ["a"]
+        assert [e.text for e in buf.drain("g2")] == ["b"]
+
+    def test_empty_text_no_attachment_not_recorded(self):
+        buf = self._buf(limit=10)
+        buf.record("g1", sender="u", text="   ")
+        assert buf.drain("g1") == []
+
+    def test_attachment_tag_recorded_when_no_text(self):
+        buf = self._buf(limit=10)
+        buf.record("g1", sender="u", text="", attachment_tag="[image]")
+        entries = buf.drain("g1")
+        assert entries and entries[0].text == "[image]"
+
+    def test_max_groups_lru_eviction(self):
+        buf = self._buf(limit=5, max_groups=2)
+        buf.record("g1", sender="u", text="a")
+        buf.record("g2", sender="u", text="b")
+        buf.record("g3", sender="u", text="c")  # evicts g1 (LRU)
+        assert buf.drain("g1") == []
+        assert [e.text for e in buf.drain("g3")] == ["c"]
+
+    def test_format_context_wraps_with_tags(self):
+        from gateway.platforms.qqbot.group_context import (
+            GroupContextBuffer, HistoryEntry, HISTORY_CTX_START, HISTORY_CTX_END,
+        )
+        entries = [HistoryEntry(sender="u1", text="hello"),
+                   HistoryEntry(sender="u2", text="world")]
+        out = GroupContextBuffer.format_context(entries, "please summarize")
+        assert HISTORY_CTX_START in out
+        assert "u1: hello" in out
+        assert "u2: world" in out
+        assert HISTORY_CTX_END in out
+        assert out.endswith("please summarize")
+
+    def test_format_context_empty_returns_current(self):
+        from gateway.platforms.qqbot.group_context import GroupContextBuffer
+        assert GroupContextBuffer.format_context([], "just this") == "just this"
+
+    def test_summarize_attachments(self):
+        from gateway.platforms.qqbot.group_context import summarize_attachments
+        assert summarize_attachments(None) == ""
+        assert summarize_attachments([]) == ""
+        assert summarize_attachments([{"content_type": "image/png"}]) == "[image]"
+        assert summarize_attachments([{"content_type": "audio/silk"}]) == "[voice]"
+        assert summarize_attachments(
+            [{"content_type": "application/zip", "filename": "a.zip"}]
+        ) == "[file: a.zip]"
+
+
+# ---------------------------------------------------------------------------
+# Group context buffer — integration through _handle_group_message
+# ---------------------------------------------------------------------------
+
+class TestGroupContextIntegration:
+    def _make_adapter(self, **extra):
+        from gateway.platforms.qqbot import QQAdapter
+        extra.setdefault("app_id", "1903885637")
+        extra.setdefault("client_secret", "b")
+        extra.setdefault("group_policy", "open")
+        return QQAdapter(_make_config(**extra))
+
+    def _drive(self, adapter):
+        captured = []
+
+        async def fake_process(_a):
+            return {"image_urls": [], "image_media_types": [],
+                    "voice_transcripts": [], "attachment_info": ""}
+
+        async def fake_quote(_d):
+            return {"quote_block": "", "image_urls": [], "image_media_types": []}
+
+        async def fake_handle(event):
+            captured.append(event)
+
+        adapter._process_attachments = fake_process  # type: ignore[assignment]
+        adapter._process_quoted_context = fake_quote  # type: ignore[assignment]
+        adapter.handle_message = fake_handle  # type: ignore[assignment]
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_mention_mode_buffers_then_injects_on_at(self):
+        adapter = self._make_adapter()  # mention mode, default limit 50
+        captured = self._drive(adapter)
+        # non-@ message → buffered, no reply.
+        await adapter._handle_group_message(
+            {"group_openid": "g1", "content": "the sky is blue"}, "m1",
+            "the sky is blue", {"member_openid": "alice"}, "",
+            "GROUP_MESSAGE_CREATE",
+        )
+        assert captured == []
+        # @ message → reply with buffered context injected.
+        await adapter._handle_group_message(
+            {"group_openid": "g1", "content": "what did she say"}, "m2",
+            "what did she say", {"member_openid": "bob"}, "",
+            "GROUP_AT_MESSAGE_CREATE",
+        )
+        assert len(captured) == 1
+        text = captured[0].text
+        assert "CONTEXT ONLY" in text
+        assert "alice: the sky is blue" in text
+        assert text.endswith("what did she say")
+
+    @pytest.mark.asyncio
+    async def test_buffer_cleared_after_injection(self):
+        adapter = self._make_adapter()
+        captured = self._drive(adapter)
+        await adapter._handle_group_message(
+            {"group_openid": "g1", "content": "ctx"}, "m1", "ctx",
+            {"member_openid": "alice"}, "", "GROUP_MESSAGE_CREATE",
+        )
+        await adapter._handle_group_message(
+            {"group_openid": "g1", "content": "q1"}, "m2", "q1",
+            {"member_openid": "bob"}, "", "GROUP_AT_MESSAGE_CREATE",
+        )
+        # second @ has no stale context.
+        await adapter._handle_group_message(
+            {"group_openid": "g1", "content": "q2"}, "m3", "q2",
+            {"member_openid": "bob"}, "", "GROUP_AT_MESSAGE_CREATE",
+        )
+        assert len(captured) == 2
+        assert "CONTEXT ONLY" not in captured[1].text
+        assert captured[1].text == "q2"
+
+    @pytest.mark.asyncio
+    async def test_always_mode_no_buffering(self):
+        adapter = self._make_adapter(group_require_mention=False)
+        captured = self._drive(adapter)
+        await adapter._handle_group_message(
+            {"group_openid": "g1", "content": "hello"}, "m1", "hello",
+            {"member_openid": "alice"}, "", "GROUP_MESSAGE_CREATE",
+        )
+        assert len(captured) == 1
+        assert captured[0].text == "hello"  # no context wrapper
+        # nothing left buffered.
+        assert adapter._group_context.drain("g1") == []
+
+    @pytest.mark.asyncio
+    async def test_history_limit_zero_disables_buffer(self):
+        adapter = self._make_adapter(group_history_limit=0)
+        captured = self._drive(adapter)
+        await adapter._handle_group_message(
+            {"group_openid": "g1", "content": "ctx"}, "m1", "ctx",
+            {"member_openid": "alice"}, "", "GROUP_MESSAGE_CREATE",
+        )
+        await adapter._handle_group_message(
+            {"group_openid": "g1", "content": "q"}, "m2", "q",
+            {"member_openid": "bob"}, "", "GROUP_AT_MESSAGE_CREATE",
+        )
+        assert len(captured) == 1
+        assert "CONTEXT ONLY" not in captured[0].text
+        assert captured[0].text == "q"
+
+    @pytest.mark.asyncio
+    async def test_empty_at_message_still_flushes_context(self):
+        # A bare @ (empty body after strip) must still flush + inject pending
+        # context, not early-return and strand the buffer.
+        adapter = self._make_adapter()
+        captured = self._drive(adapter)
+        await adapter._handle_group_message(
+            {"group_openid": "g1", "content": "background note"}, "m1",
+            "background note", {"member_openid": "alice"}, "",
+            "GROUP_MESSAGE_CREATE",
+        )
+        await adapter._handle_group_message(
+            {"group_openid": "g1", "content": ""}, "m2", "",
+            {"member_openid": "bob"}, "", "GROUP_AT_MESSAGE_CREATE",
+        )
+        assert len(captured) == 1
+        assert "alice: background note" in captured[0].text
+        # buffer cleared.
+        assert adapter._group_context.drain("g1") == []
+
+    @pytest.mark.asyncio
+    async def test_injection_keeps_current_message_with_attachments_last(self):
+        # Lock the order: buffered context first, current message (incl. its
+        # appended attachment_info) last.
+        adapter = self._make_adapter()
+        captured = self._drive(adapter)
+
+        async def fake_process(_a):
+            return {"image_urls": [], "image_media_types": [],
+                    "voice_transcripts": [], "attachment_info": "[file: doc.pdf]"}
+
+        adapter._process_attachments = fake_process  # type: ignore[assignment]
+
+        await adapter._handle_group_message(
+            {"group_openid": "g1", "content": "earlier"}, "m1", "earlier",
+            {"member_openid": "alice"}, "", "GROUP_MESSAGE_CREATE",
+        )
+        # NB: alice's non-@ message uses the light attachment tag, not the full
+        # processor; the @ message below exercises the full path.
+        await adapter._handle_group_message(
+            {"group_openid": "g1", "content": "see attached"}, "m2",
+            "see attached", {"member_openid": "bob"}, "",
+            "GROUP_AT_MESSAGE_CREATE",
+        )
+        text = captured[0].text
+        assert text.index("earlier") < text.index("see attached")
+        assert text.index("see attached") < text.index("[file: doc.pdf]")
+        assert "CONTEXT ONLY" in text

@@ -138,6 +138,10 @@ from gateway.platforms.qqbot.group_activation import (
     detect_mentioned,
     resolve_require_mention,
 )
+from gateway.platforms.qqbot.group_context import (
+    GroupContextBuffer,
+    summarize_attachments,
+)
 
 
 def check_qq_requirements() -> bool:
@@ -240,6 +244,12 @@ class QQAdapter(BasePlatformAdapter):
         # a /-command would write here and persist via cli.save_config_value.
         # Empty in this release.
         self._group_mode_runtime_overrides: Dict[str, bool] = {}
+
+        # Group context buffer (mention mode): non-@ messages are remembered per
+        # group and injected as CONTEXT ONLY on the next @-reply. Default 50;
+        # group_history_limit <= 0 disables buffering.
+        self._group_history_limit = int(extra.get("group_history_limit", 50))
+        self._group_context = GroupContextBuffer(limit=self._group_history_limit)
 
         # Connection state
         self._session: Optional[aiohttp.ClientSession] = None
@@ -1380,11 +1390,17 @@ class QQAdapter(BasePlatformAdapter):
             runtime_overrides=self._group_mode_runtime_overrides,
         )
         if require_mention and not mentioned:
-            # mention mode + message not addressed to the bot → do not reply.
-            # (Group context buffering of these messages is added in
-            # sub-requirement 2.)
+            # mention mode + message not addressed to the bot → do not reply,
+            # but remember it as pending context for the next @-reply (2.2.1).
+            self._group_context.record(
+                group_openid,
+                sender=member_openid,
+                text=content,
+                msg_id=msg_id,
+                attachment_tag=summarize_attachments(d.get("attachments")),
+            )
             logger.debug(
-                "[%s] Group %s: skip non-mention message (mention mode, event=%s)",
+                "[%s] Group %s: buffered non-mention message (mention mode, event=%s)",
                 self._log_tag, group_openid, event_type,
             )
             return
@@ -1417,6 +1433,15 @@ class QQAdapter(BasePlatformAdapter):
         if quoted["image_urls"]:
             image_urls = image_urls + quoted["image_urls"]
             image_media_types = image_media_types + quoted["image_media_types"]
+
+        # (6) mention-mode @-activation: prepend any buffered non-@ messages as
+        # CONTEXT ONLY, then clear the group's buffer (2.2.1). Done BEFORE the
+        # empty check so an @-message with no body (e.g. a bare @) still flushes
+        # and injects the pending context. In always mode the buffer is empty
+        # (nothing was recorded), so drain is a harmless no-op.
+        pending = self._group_context.drain(group_openid)
+        if pending:
+            text = GroupContextBuffer.format_context(pending, text)
 
         if not text.strip() and not image_urls:
             return

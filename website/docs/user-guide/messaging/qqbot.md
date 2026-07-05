@@ -88,6 +88,9 @@ platforms:
       group_sessions_per_user: true  # true (default) = each member gets an
                                      # isolated session; set false so ALL members
                                      # of a group share ONE conversation session
+      group_history_limit: 50        # (mention mode) non-@ messages buffered per
+                                     # group and injected as CONTEXT ONLY on the
+                                     # next @-reply; <=0 disables buffering
       stt:
         provider: "zai"          # zai (GLM-ASR), openai (Whisper), etc.
         baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4"
