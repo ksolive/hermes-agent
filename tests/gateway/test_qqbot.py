@@ -2293,3 +2293,217 @@ class TestReadEventsClosedWsGuard:
         adapter._ws = None
         with pytest.raises(RuntimeError):
             asyncio.run(adapter._read_events())
+
+
+# ---------------------------------------------------------------------------
+# Group activation mode — mention detection (group_activation.detect_mentioned)
+# ---------------------------------------------------------------------------
+
+class TestDetectMentioned:
+    def test_group_at_event_always_mentioned(self):
+        from gateway.platforms.qqbot.group_activation import detect_mentioned
+        assert detect_mentioned("GROUP_AT_MESSAGE_CREATE", {}, "hi", "app1") is True
+
+    def test_mentions_is_you_true(self):
+        from gateway.platforms.qqbot.group_activation import detect_mentioned
+        d = {"mentions": [{"member_openid": "x"}, {"is_you": True}]}
+        assert detect_mentioned("GROUP_MESSAGE_CREATE", d, "hi", "app1") is True
+
+    def test_explicit_tag_for_our_app_id(self):
+        from gateway.platforms.qqbot.group_activation import detect_mentioned
+        assert detect_mentioned(
+            "GROUP_MESSAGE_CREATE", {}, "<@!1903885637> hello", "1903885637"
+        ) is True
+
+    def test_tag_for_other_member_not_mentioned(self):
+        from gateway.platforms.qqbot.group_activation import detect_mentioned
+        # @ of a different member must NOT count as addressing the bot.
+        assert detect_mentioned(
+            "GROUP_MESSAGE_CREATE", {}, "<@!99999> hello", "1903885637"
+        ) is False
+
+    def test_plain_message_not_mentioned(self):
+        from gateway.platforms.qqbot.group_activation import detect_mentioned
+        assert detect_mentioned(
+            "GROUP_MESSAGE_CREATE", {}, "just chatting", "1903885637"
+        ) is False
+
+    def test_generic_at_prefix_not_treated_as_bot(self):
+        from gateway.platforms.qqbot.group_activation import detect_mentioned
+        # Conservative: a bare "@alice " prefix is NOT a bot mention.
+        assert detect_mentioned(
+            "GROUP_MESSAGE_CREATE", {}, "@alice look here", "1903885637"
+        ) is False
+
+
+# ---------------------------------------------------------------------------
+# Group activation mode — require_mention resolution
+# ---------------------------------------------------------------------------
+
+class TestResolveRequireMention:
+    def test_global_default_true(self):
+        from gateway.platforms.qqbot.group_activation import resolve_require_mention
+        assert resolve_require_mention("g1", global_default=True) is True
+
+    def test_global_default_false(self):
+        from gateway.platforms.qqbot.group_activation import resolve_require_mention
+        assert resolve_require_mention("g1", global_default=False) is False
+
+    def test_per_group_overrides_global(self):
+        from gateway.platforms.qqbot.group_activation import resolve_require_mention
+        # global always, but g1 forced to mention.
+        assert resolve_require_mention(
+            "g1", global_default=False, per_group={"g1": True}
+        ) is True
+        # other group still follows global.
+        assert resolve_require_mention(
+            "g2", global_default=False, per_group={"g1": True}
+        ) is False
+
+    def test_runtime_override_wins(self):
+        from gateway.platforms.qqbot.group_activation import resolve_require_mention
+        assert resolve_require_mention(
+            "g1", global_default=True, per_group={"g1": True},
+            runtime_overrides={"g1": False},
+        ) is False
+
+
+# ---------------------------------------------------------------------------
+# Group activation mode — config parsing + gate (_handle_group_message)
+# ---------------------------------------------------------------------------
+
+class TestGroupActivationMode:
+    def _make_adapter(self, **extra):
+        from gateway.platforms.qqbot import QQAdapter
+        extra.setdefault("app_id", "1903885637")
+        extra.setdefault("client_secret", "b")
+        extra.setdefault("group_policy", "open")
+        return QQAdapter(_make_config(**extra))
+
+    def test_default_mode_is_mention(self):
+        adapter = self._make_adapter()
+        assert adapter._group_require_mention is True
+
+    def test_always_mode_from_config(self):
+        adapter = self._make_adapter(group_require_mention=False)
+        assert adapter._group_require_mention is False
+
+    def test_per_group_override_parsed(self):
+        adapter = self._make_adapter(
+            group_require_mention=False,
+            groups={"grp_a": {"require_mention": True}},
+        )
+        assert adapter._group_mode_overrides == {"grp_a": True}
+
+    def _drive(self, adapter):
+        """Stub the assembly path and capture handle_message events."""
+        captured = []
+
+        async def fake_process(_a):
+            return {"image_urls": [], "image_media_types": [],
+                    "voice_transcripts": [], "attachment_info": ""}
+
+        async def fake_quote(_d):
+            return {"quote_block": "", "image_urls": [], "image_media_types": []}
+
+        async def fake_handle(event):
+            captured.append(event)
+
+        adapter._process_attachments = fake_process  # type: ignore[assignment]
+        adapter._process_quoted_context = fake_quote  # type: ignore[assignment]
+        adapter.handle_message = fake_handle  # type: ignore[assignment]
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_mention_mode_skips_non_mention_group_message(self):
+        adapter = self._make_adapter()  # default mention
+        captured = self._drive(adapter)
+        d = {"group_openid": "g1", "content": "hello everyone"}
+        await adapter._handle_group_message(
+            d, "m1", "hello everyone", {"member_openid": "u1"}, "",
+            "GROUP_MESSAGE_CREATE",
+        )
+        assert captured == []  # skipped, no reply
+
+    @pytest.mark.asyncio
+    async def test_mention_mode_handles_at_message(self):
+        adapter = self._make_adapter()  # default mention
+        captured = self._drive(adapter)
+        d = {"group_openid": "g1", "content": "hi bot"}
+        await adapter._handle_group_message(
+            d, "m1", "hi bot", {"member_openid": "u1"}, "",
+            "GROUP_AT_MESSAGE_CREATE",
+        )
+        assert len(captured) == 1
+        assert captured[0].source.chat_id == "g1"
+        assert captured[0].source.chat_type == "group"
+
+    @pytest.mark.asyncio
+    async def test_always_mode_handles_non_mention_group_message(self):
+        adapter = self._make_adapter(group_require_mention=False)  # always
+        captured = self._drive(adapter)
+        d = {"group_openid": "g1", "content": "just chatting"}
+        await adapter._handle_group_message(
+            d, "m1", "just chatting", {"member_openid": "u1"}, "",
+            "GROUP_MESSAGE_CREATE",
+        )
+        assert len(captured) == 1
+        assert captured[0].text == "just chatting"
+
+    @pytest.mark.asyncio
+    async def test_per_group_mention_override_blocks_in_always_global(self):
+        adapter = self._make_adapter(
+            group_require_mention=False,
+            groups={"g1": {"require_mention": True}},
+        )
+        captured = self._drive(adapter)
+        # g1 forced to mention -> non-@ skipped.
+        await adapter._handle_group_message(
+            {"group_openid": "g1", "content": "hey"}, "m1", "hey",
+            {"member_openid": "u1"}, "", "GROUP_MESSAGE_CREATE",
+        )
+        assert captured == []
+        # g2 follows global always -> handled.
+        await adapter._handle_group_message(
+            {"group_openid": "g2", "content": "hey"}, "m2", "hey",
+            {"member_openid": "u1"}, "", "GROUP_MESSAGE_CREATE",
+        )
+        assert len(captured) == 1
+
+    @pytest.mark.asyncio
+    async def test_group_acl_blocks_before_gate(self):
+        adapter = self._make_adapter(group_policy="disabled",
+                                     group_require_mention=False)
+        captured = self._drive(adapter)
+        await adapter._handle_group_message(
+            {"group_openid": "g1", "content": "hi"}, "m1", "hi",
+            {"member_openid": "u1"}, "", "GROUP_MESSAGE_CREATE",
+        )
+        assert captured == []
+
+
+# ---------------------------------------------------------------------------
+# Group shared session (2.1) — group_sessions_per_user key behaviour
+# ---------------------------------------------------------------------------
+
+class TestGroupSharedSession:
+    def _source(self):
+        from gateway.session import SessionSource
+        from gateway.config import Platform
+        return SessionSource(
+            platform=Platform.QQBOT,
+            chat_id="group_openid_1",
+            chat_type="group",
+            user_id="member_openid_1",
+        )
+
+    def test_isolated_key_includes_participant_by_default(self):
+        from gateway.session import build_session_key
+        key = build_session_key(self._source(), group_sessions_per_user=True)
+        assert key.endswith(":member_openid_1")
+
+    def test_shared_key_excludes_participant(self):
+        from gateway.session import build_session_key
+        key = build_session_key(self._source(), group_sessions_per_user=False)
+        assert "member_openid_1" not in key
+        assert key.endswith(":group_openid_1")

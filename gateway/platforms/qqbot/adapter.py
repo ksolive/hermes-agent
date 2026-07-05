@@ -134,6 +134,10 @@ from gateway.platforms.qqbot.keyboards import (
     parse_interaction_event,
     parse_update_prompt_button_data,
 )
+from gateway.platforms.qqbot.group_activation import (
+    detect_mentioned,
+    resolve_require_mention,
+)
 
 
 def check_qq_requirements() -> bool:
@@ -216,6 +220,26 @@ class QQAdapter(BasePlatformAdapter):
         self._group_allow_from = _coerce_list(
             extra.get("group_allow_from") or extra.get("groupAllowFrom")
         )
+
+        # Group activation mode (always vs mention). Default: mention — the bot
+        # only replies when @-ed (aligns with openclaw requireMention default).
+        # always mode (require_mention=False) lets any group message trigger a
+        # reply; it also needs the "receive all group messages" permission on
+        # the QQ platform to actually receive GROUP_MESSAGE_CREATE events.
+        self._group_require_mention = bool(extra.get("group_require_mention", True))
+        # Per-group override: groups.{group_openid}.require_mention (group > global).
+        self._group_mode_overrides: Dict[str, bool] = {}
+        _groups_cfg = extra.get("groups")
+        if isinstance(_groups_cfg, dict):
+            for _gid, _gcfg in _groups_cfg.items():
+                if isinstance(_gcfg, dict) and "require_mention" in _gcfg:
+                    self._group_mode_overrides[str(_gid)] = bool(
+                        _gcfg["require_mention"]
+                    )
+        # Reserved for a future runtime mode-switch command (solution 2.2.3):
+        # a /-command would write here and persist via cli.save_config_value.
+        # Empty in this release.
+        self._group_mode_runtime_overrides: Dict[str, bool] = {}
 
         # Connection state
         self._session: Optional[aiohttp.ClientSession] = None
@@ -857,6 +881,7 @@ class QQAdapter(BasePlatformAdapter):
             elif t in {
                     "C2C_MESSAGE_CREATE",
                     "GROUP_AT_MESSAGE_CREATE",
+                    "GROUP_MESSAGE_CREATE",
                     "DIRECT_MESSAGE_CREATE",
                     "GUILD_MESSAGE_CREATE",
                     "GUILD_AT_MESSAGE_CREATE",
@@ -956,8 +981,10 @@ class QQAdapter(BasePlatformAdapter):
         # Route by event type
         if event_type == "C2C_MESSAGE_CREATE":
             await self._handle_c2c_message(d, msg_id, content, author, timestamp)
-        elif event_type in {"GROUP_AT_MESSAGE_CREATE",}:
-            await self._handle_group_message(d, msg_id, content, author, timestamp)
+        elif event_type in {"GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"}:
+            await self._handle_group_message(
+                d, msg_id, content, author, timestamp, event_type
+            )
         elif event_type in {"GUILD_MESSAGE_CREATE", "GUILD_AT_MESSAGE_CREATE"}:
             await self._handle_guild_message(d, msg_id, content, author, timestamp)
         elif event_type == "DIRECT_MESSAGE_CREATE":
@@ -1319,18 +1346,52 @@ class QQAdapter(BasePlatformAdapter):
             content: str,
             author: Dict[str, Any],
             timestamp: str,
+            event_type: str = "GROUP_AT_MESSAGE_CREATE",
     ) -> None:
-        """Handle a group @-message event."""
+        """Handle a group message event.
+
+        Handles both ``GROUP_AT_MESSAGE_CREATE`` (bot @-ed) and, when the QQ
+        platform pushes full group traffic and/or the bot runs in always mode,
+        ``GROUP_MESSAGE_CREATE`` (any group message). The activation decision
+        is:
+
+        1. group-level ACL (``_is_group_allowed``; user_id is intentionally not
+           used — per-user filtering is out of scope);
+        2. mention detection (``detect_mentioned``);
+        3. mode resolution (``resolve_require_mention``: global +
+           per-group override);
+        4. gate: mention mode + not-mentioned → skip (no reply); otherwise
+           process and reply.
+        """
         group_openid = str(d.get("group_openid", ""))
         if not group_openid:
             return
-        if not self._is_group_allowed(
-                group_openid, str(author.get("member_openid", ""))
-        ):
+        member_openid = str(author.get("member_openid", ""))
+        # (1) ACL — group-level (per-user filtering intentionally out of scope).
+        if not self._is_group_allowed(group_openid, member_openid):
             return
 
-        # Strip the @bot mention prefix from content
-        text = self._strip_at_mention(content)
+        # (2) mention detection + (3) mode resolution + (4) activation gate.
+        mentioned = detect_mentioned(event_type, d, content, self._app_id)
+        require_mention = resolve_require_mention(
+            group_openid,
+            global_default=self._group_require_mention,
+            per_group=self._group_mode_overrides,
+            runtime_overrides=self._group_mode_runtime_overrides,
+        )
+        if require_mention and not mentioned:
+            # mention mode + message not addressed to the bot → do not reply.
+            # (Group context buffering of these messages is added in
+            # sub-requirement 2.)
+            logger.debug(
+                "[%s] Group %s: skip non-mention message (mention mode, event=%s)",
+                self._log_tag, group_openid, event_type,
+            )
+            return
+
+        # (5) pass: assemble the message (reuse the existing media / quote /
+        # markdown path). Only strip the @bot prefix when actually mentioned.
+        text = self._strip_at_mention(content) if mentioned else content
         att_result = await self._process_attachments(d.get("attachments"))
         image_urls = att_result["image_urls"]
         image_media_types = att_result["image_media_types"]
