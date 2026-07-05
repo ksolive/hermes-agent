@@ -257,6 +257,150 @@ class TestStripAtMention:
     def test_only_mention(self):
         assert self._fn("@Someone  ") == ""
 
+    def test_strips_explicit_mention_tag(self):
+        # Full-push GROUP_MESSAGE_CREATE may carry the <@!id> tag form.
+        assert self._fn("<@!1903885637> hello there") == "hello there"
+
+    def test_strips_tag_midstring(self):
+        assert self._fn("hey <@!123> how are you") == "hey  how are you"
+
+
+# ---------------------------------------------------------------------------
+# Group rich media / markdown parity (2.3)
+# ---------------------------------------------------------------------------
+
+class TestGroupMediaMarkdown:
+    def _make_adapter(self, **extra):
+        from gateway.platforms.qqbot import QQAdapter
+        extra.setdefault("app_id", "1903885637")
+        extra.setdefault("client_secret", "b")
+        extra.setdefault("group_policy", "open")
+        return QQAdapter(_make_config(**extra))
+
+    @pytest.mark.asyncio
+    async def test_group_inbound_image_populates_media_urls(self):
+        adapter = self._make_adapter(group_require_mention=False)  # always
+        captured = []
+
+        async def fake_process(_a):
+            return {"image_urls": ["/tmp/x.jpg"],
+                    "image_media_types": ["image/jpeg"],
+                    "voice_transcripts": [], "attachment_info": ""}
+
+        async def fake_quote(_d):
+            return {"quote_block": "", "image_urls": [], "image_media_types": []}
+
+        async def fake_handle(event):
+            captured.append(event)
+
+        adapter._process_attachments = fake_process  # type: ignore[assignment]
+        adapter._process_quoted_context = fake_quote  # type: ignore[assignment]
+        adapter.handle_message = fake_handle  # type: ignore[assignment]
+
+        await adapter._handle_group_message(
+            {"group_openid": "g1", "content": "look",
+             "attachments": [{"content_type": "image/jpeg", "url": "u"}]},
+            "m1", "look", {"member_openid": "u1"}, "", "GROUP_MESSAGE_CREATE",
+        )
+        assert len(captured) == 1
+        assert captured[0].media_urls == ["/tmp/x.jpg"]
+        assert captured[0].media_types == ["image/jpeg"]
+
+    @pytest.mark.asyncio
+    async def test_group_markdown_send_routes_to_group_endpoint(self):
+        adapter = self._make_adapter(markdown_support=True)
+        adapter._running = True
+        adapter._ws = SimpleNamespace(closed=False)
+        adapter._chat_type_map["g1"] = "group"
+        calls = []
+
+        async def fake_api(method, path, body=None, **kw):
+            calls.append((method, path, body))
+            return {"id": "sent1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        result = await adapter.send("g1", "**bold** reply")
+        assert result.success
+        assert calls and calls[0][1] == "/v2/groups/g1/messages"
+        # markdown_support=True → markdown msg_type (2).
+        assert calls[0][2]["msg_type"] == 2
+        assert calls[0][2]["markdown"]["content"] == "**bold** reply"
+
+    @pytest.mark.asyncio
+    async def test_group_plaintext_send_routes_to_group_endpoint(self):
+        # Default markdown_support=False → plain text msg_type (0).
+        adapter = self._make_adapter(markdown_support=False)
+        adapter._running = True
+        adapter._ws = SimpleNamespace(closed=False)
+        adapter._chat_type_map["g1"] = "group"
+        calls = []
+
+        async def fake_api(method, path, body=None, **kw):
+            calls.append((method, path, body))
+            return {"id": "sent2"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        result = await adapter.send("g1", "plain reply", reply_to="mm1")
+        assert result.success
+        assert calls[0][1] == "/v2/groups/g1/messages"
+        assert calls[0][2]["msg_type"] == 0
+        assert calls[0][2]["content"] == "plain reply"
+        assert calls[0][2].get("msg_id") == "mm1"
+
+    @pytest.mark.asyncio
+    async def test_group_media_send_posts_msg_type_media(self):
+        adapter = self._make_adapter()
+        adapter._running = True
+        adapter._ws = SimpleNamespace(closed=False)
+        adapter._chat_type_map["g1"] = "group"
+        calls = []
+
+        async def fake_upload(chat_type, chat_id, file_type, **kw):
+            return {"file_info": "FILEINFO"}
+
+        async def fake_api(method, path, body=None, **kw):
+            calls.append((method, path, body))
+            return {"id": "media1"}
+
+        adapter._upload_media = fake_upload  # type: ignore[assignment]
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        result = await adapter._send_media(
+            "g1", "https://example.com/x.jpg", 1, "image",
+        )
+        assert result.success
+        assert calls and calls[0][1] == "/v2/groups/g1/messages"
+        assert calls[0][2]["msg_type"] == 7  # MSG_TYPE_MEDIA
+        assert calls[0][2]["media"]["file_info"] == "FILEINFO"
+
+
+# ---------------------------------------------------------------------------
+# Reserved runtime mode-switch hook (2.2.3)
+# ---------------------------------------------------------------------------
+
+class TestGroupModeRuntimeOverride:
+    def _make_adapter(self, **extra):
+        from gateway.platforms.qqbot import QQAdapter
+        extra.setdefault("app_id", "a")
+        extra.setdefault("client_secret", "b")
+        return QQAdapter(_make_config(**extra))
+
+    def test_override_takes_effect(self):
+        from gateway.platforms.qqbot.group_activation import resolve_require_mention
+        adapter = self._make_adapter(group_require_mention=True)
+        adapter._set_group_mode_override("g1", require_mention=False)
+        assert adapter._group_mode_runtime_overrides == {"g1": False}
+        # resolve should now honour the runtime override for g1.
+        eff = resolve_require_mention(
+            "g1",
+            global_default=adapter._group_require_mention,
+            per_group=adapter._group_mode_overrides,
+            runtime_overrides=adapter._group_mode_runtime_overrides,
+        )
+        assert eff is False
+
 
 # ---------------------------------------------------------------------------
 # _is_dm_allowed

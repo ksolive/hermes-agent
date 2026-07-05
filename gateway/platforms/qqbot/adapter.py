@@ -3236,12 +3236,39 @@ class QQAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _strip_at_mention(content: str) -> str:
-        """Strip the @bot mention prefix from group message content."""
-        # QQ group @-messages may have the bot's QQ/ID as prefix
+        """Strip @bot mention markers from group message content.
+
+        Handles both forms QQ may deliver:
+
+        - the explicit ``<@!123>`` mention tag (full-push GROUP_MESSAGE_CREATE),
+          aligning with openclaw ``MENTION_TAG_RE``;
+        - the legacy leading ``@name `` prefix (GROUP_AT_MESSAGE_CREATE where the
+          platform already rendered the tag as plain text).
+        """
         import re
 
-        stripped = re.sub(r"^@\S+\s*", "", content.strip())
-        return stripped
+        # Remove explicit mention tags anywhere in the content.
+        stripped = re.sub(r"<@!?\d+>", "", content).strip()
+        # Remove a leading "@name " prefix if present.
+        stripped = re.sub(r"^@\S+\s*", "", stripped)
+        return stripped.strip()
+
+    def _set_group_mode_override(
+        self, group_openid: str, require_mention: bool
+    ) -> None:
+        """Set an in-memory activation-mode override for a single group.
+
+        Reserved integration point for a future runtime mode-switch command
+        (solution 2.2.3). It updates the highest-priority override consulted by
+        :func:`resolve_require_mention`. A command handler would call this and
+        then persist the change via ``cli.save_config_value`` — persistence and
+        the command wiring are intentionally out of scope this round because a
+        ``/``-command requires changes to the shared command framework.
+        """
+        if group_openid:
+            self._group_mode_runtime_overrides[str(group_openid)] = bool(
+                require_mention
+            )
 
     def _open_dm_opted_in(self) -> bool:
         if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
