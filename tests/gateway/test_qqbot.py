@@ -427,6 +427,60 @@ class TestQQCloseError:
 
 
 # ---------------------------------------------------------------------------
+# connect() signature — reconnect contract (Part 1 fix)
+# ---------------------------------------------------------------------------
+
+class TestConnectSignature:
+    """QQAdapter.connect must honour the BasePlatformAdapter reconnect contract.
+
+    The gateway (run.py _connect_adapter_with_timeout) always calls
+    ``adapter.connect(is_reconnect=...)``.  A ``connect(self)`` signature
+    raised ``TypeError: got an unexpected keyword argument 'is_reconnect'``
+    on cold boot, so QQBot could never start. These guard against a
+    regression of that signature.
+    """
+
+    def _make_adapter(self, **extra):
+        from gateway.platforms.qqbot import QQAdapter
+        return QQAdapter(_make_config(**extra))
+
+    def test_connect_accepts_is_reconnect_keyword_only(self):
+        import inspect
+        from gateway.platforms.qqbot import QQAdapter
+
+        sig = inspect.signature(QQAdapter.connect)
+        assert "is_reconnect" in sig.parameters
+        param = sig.parameters["is_reconnect"]
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        assert param.default is False
+
+    def test_connect_signature_matches_base_contract(self):
+        import inspect
+        from gateway.platforms.base import BasePlatformAdapter
+        from gateway.platforms.qqbot import QQAdapter
+
+        base_params = inspect.signature(BasePlatformAdapter.connect).parameters
+        qq_params = inspect.signature(QQAdapter.connect).parameters
+        # The reconnect kwarg from the base contract must be present + compatible.
+        assert base_params["is_reconnect"].kind == qq_params["is_reconnect"].kind
+        assert base_params["is_reconnect"].default == qq_params["is_reconnect"].default
+
+    @pytest.mark.asyncio
+    async def test_connect_is_reconnect_true_no_typeerror(self):
+        # Missing credentials → connect returns False *before* any network I/O,
+        # but the point is that passing is_reconnect=True must NOT raise.
+        adapter = self._make_adapter()
+        result = await adapter.connect(is_reconnect=True)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_connect_is_reconnect_false_no_typeerror(self):
+        adapter = self._make_adapter()
+        result = await adapter.connect(is_reconnect=False)
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
 # _dispatch_payload
 # ---------------------------------------------------------------------------
 

@@ -278,8 +278,23 @@ class QQAdapter(BasePlatformAdapter):
     # Connection lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
-        """Authenticate, obtain gateway URL, and open the WebSocket."""
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Authenticate, obtain gateway URL, and open the WebSocket.
+
+        ``is_reconnect`` is part of the ``BasePlatformAdapter.connect``
+        contract (``base.py``): the gateway wiring path (``run.py``
+        ``_connect_adapter_with_timeout``) always calls
+        ``adapter.connect(is_reconnect=...)`` — ``False`` on a cold first boot,
+        ``True`` when the reconnect watcher re-establishes the platform after
+        an outage. Adapters MUST accept the kwarg or that path raises
+        ``TypeError`` and QQBot can never start / recover.
+
+        QQ has no server-side update queue to preserve (unlike Telegram's Bot
+        API), so the flag carries no behavioural difference here — the QQ
+        WebSocket transparently resumes via ``session_id``/``seq`` on its own.
+        We accept and ignore it to honour the shared contract.
+        """
+        del is_reconnect  # QQ WS resume is handled internally; no queue to keep
         if not AIOHTTP_AVAILABLE:
             message = "QQ startup failed: aiohttp not installed"
             self._set_fatal_error("qq_missing_dependency", message, retryable=True)
