@@ -73,7 +73,7 @@ platforms:
       dm_policy: "open"          # open | allowlist | disabled
       allow_from:
         - "user_openid_1"
-      group_policy: "open"       # open | allowlist | disabled
+      group_policy: "open"       # open | allowlist | disabled (default: disabled)
       group_allow_from:
         - "group_openid_1"
       # ── Group activation mode (always vs mention) ──
@@ -88,7 +88,7 @@ platforms:
       group_sessions_per_user: true  # true (default) = each member gets an
                                      # isolated session; set false so ALL members
                                      # of a group share ONE conversation session
-      group_history_limit: 50        # (mention mode) non-@ messages buffered per
+      group_history_limit: 20        # (mention mode) non-@ messages buffered per
                                      # group and injected as CONTEXT ONLY on the
                                      # next @-reply; <=0 disables buffering
       stt:

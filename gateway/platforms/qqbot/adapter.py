@@ -14,7 +14,7 @@ Configuration in config.yaml:
           markdown_support: true           # enable QQ markdown (msg_type 2)
           dm_policy: "pairing"             # open | allowlist | disabled | pairing
           allow_from: ["openid_1"]
-          group_policy: "pairing"          # open | allowlist | disabled | pairing
+          group_policy: "disabled"         # open | allowlist | disabled
           group_allow_from: ["group_openid_1"]
           stt:                             # Voice-to-text config (optional)
             provider: "zai"                # zai (GLM-ASR), openai (Whisper), etc.
@@ -220,7 +220,20 @@ class QQAdapter(BasePlatformAdapter):
         self._allow_from = _coerce_list(
             extra.get("allow_from") or extra.get("allowFrom")
         )
-        self._group_policy = str(extra.get("group_policy", "pairing")).strip().lower()
+        # Group ACL policy — mirrors Feishu (open | allowlist | disabled).
+        # Default is "disabled" (safe-by-default: no group receives replies
+        # until explicitly enabled). QQ does not implement a group "pairing"
+        # handshake, so pairing is intentionally not offered for groups
+        # (unlike dm_policy, where QQ C2C supports pairing).
+        raw_group_policy = str(extra.get("group_policy", "disabled")).strip().lower()
+        if raw_group_policy not in {"open", "allowlist", "disabled"}:
+            logger.warning(
+                "[%s] Unknown group_policy=%r; falling back to 'disabled'. "
+                "Supported: open | allowlist | disabled.",
+                self._log_tag, raw_group_policy,
+            )
+            raw_group_policy = "disabled"
+        self._group_policy = raw_group_policy
         self._group_allow_from = _coerce_list(
             extra.get("group_allow_from") or extra.get("groupAllowFrom")
         )
@@ -246,9 +259,9 @@ class QQAdapter(BasePlatformAdapter):
         self._group_mode_runtime_overrides: Dict[str, bool] = {}
 
         # Group context buffer (mention mode): non-@ messages are remembered per
-        # group and injected as CONTEXT ONLY on the next @-reply. Default 50;
+        # group and injected as CONTEXT ONLY on the next @-reply. Default 20;
         # group_history_limit <= 0 disables buffering.
-        self._group_history_limit = int(extra.get("group_history_limit", 50))
+        self._group_history_limit = int(extra.get("group_history_limit", 20))
         self._group_context = GroupContextBuffer(limit=self._group_history_limit)
 
         # Connection state
@@ -1379,6 +1392,12 @@ class QQAdapter(BasePlatformAdapter):
         member_openid = str(author.get("member_openid", ""))
         # (1) ACL — group-level (per-user filtering intentionally out of scope).
         if not self._is_group_allowed(group_openid, member_openid):
+            logger.debug(
+                "[%s] Group message blocked by ACL: group=%r "
+                "policy=%s (set platforms.qqbot.extra.group_policy=open, or "
+                "'allowlist' with this group in group_allow_from, to enable).",
+                self._log_tag, group_openid, self._group_policy,
+            )
             return
 
         # (2) mention detection + (3) mode resolution + (4) activation gate.
@@ -3303,8 +3322,6 @@ class QQAdapter(BasePlatformAdapter):
             return False
         if self._group_policy == "allowlist":
             return self._entry_matches(self._group_allow_from, group_id)
-        if self._group_policy == "pairing":
-            return False
         if self._group_policy == "open":
             return True
         return False

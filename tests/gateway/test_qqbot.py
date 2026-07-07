@@ -65,7 +65,7 @@ class TestQQAdapterInit:
 
     def test_group_policy_default(self):
         adapter = self._make(app_id="a", client_secret="b")
-        assert adapter._group_policy == "pairing"
+        assert adapter._group_policy == "disabled"
 
     def test_allow_from_parsing_string(self):
         adapter = self._make(app_id="a", client_secret="b", allow_from="x, y , z")
@@ -460,8 +460,17 @@ class TestGroupAllowed:
         assert adapter._is_group_allowed("grp2", "user1") is False
 
     def test_pairing_default_blocks_groups(self):
+        # group_policy default is now "disabled" (Feishu-aligned: no
+        # "pairing" mode for groups). Any group message is denied by default.
         adapter = self._make_adapter(app_id="a", client_secret="b")
-        assert adapter._group_policy == "pairing"
+        assert adapter._group_policy == "disabled"
+        assert adapter._is_group_allowed("grp1", "user1") is False
+
+    def test_unknown_group_policy_falls_back_to_disabled(self):
+        adapter = self._make_adapter(
+            app_id="a", client_secret="b", group_policy="pairing",  # no longer valid
+        )
+        assert adapter._group_policy == "disabled"
         assert adapter._is_group_allowed("grp1", "user1") is False
 
     def test_pairing_default_strict_dm_auth_denies_unknown(self):
@@ -2624,6 +2633,28 @@ class TestGroupActivationMode:
             {"member_openid": "u1"}, "", "GROUP_MESSAGE_CREATE",
         )
         assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_group_acl_reject_emits_debug_log(self, caplog):
+        # ACL rejection must leave an operator-visible breadcrumb explaining
+        # both the cause (policy=disabled) and how to unblock it.
+        import logging
+        adapter = self._make_adapter(group_policy="disabled")
+        self._drive(adapter)
+        with caplog.at_level(logging.DEBUG, logger="gateway.platforms.qqbot"):
+            await adapter._handle_group_message(
+                {"group_openid": "gX", "content": "hi"}, "m1", "hi",
+                {"member_openid": "u1"}, "", "GROUP_AT_MESSAGE_CREATE",
+            )
+        log_text = " ".join(r.message for r in caplog.records)
+        assert "blocked by ACL" in log_text
+        assert "gX" in log_text
+        assert "policy=disabled" in log_text
+        assert "group_policy" in log_text  # hint on how to unblock
+
+    def test_default_history_limit_is_20(self):
+        adapter = self._make_adapter()
+        assert adapter._group_history_limit == 20
 
 
 # ---------------------------------------------------------------------------
