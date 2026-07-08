@@ -3531,21 +3531,55 @@ class QQAdapter(BasePlatformAdapter):
         The QQ API requires the originating message ID — retrieved from
         ``_last_msg_id`` which is populated by ``_on_message``.
         """
+        logger.debug(
+            "[%s] send_typing called: chat_id=%s connected=%s",
+            self._log_tag,
+            chat_id,
+            self.is_connected,
+        )
+
         if not self.is_connected:
+            logger.debug(
+                "[%s] send_typing skipped: adapter not connected, chat_id=%s",
+                self._log_tag,
+                chat_id,
+            )
             return
 
         chat_type = self._guess_chat_type(chat_id)
         if chat_type != "c2c":
+            logger.debug(
+                "[%s] send_typing skipped: chat_type=%s (only c2c supported), chat_id=%s",
+                self._log_tag,
+                chat_type,
+                chat_id,
+            )
             return
 
         msg_id = self._last_msg_id.get(chat_id)
         if not msg_id:
+            logger.debug(
+                "[%s] send_typing skipped: no passive msg_id available, chat_id=%s "
+                "(user has not sent a message yet or _last_msg_id was cleared)",
+                self._log_tag,
+                chat_id,
+            )
             return
 
         # Debounce — skip if we sent recently
         now = time.time()
         last_sent = self._typing_sent_at.get(chat_id, 0.0)
-        if now - last_sent < self._TYPING_DEBOUNCE_SECONDS:
+        elapsed = now - last_sent
+        if elapsed < self._TYPING_DEBOUNCE_SECONDS:
+            logger.debug(
+                "[%s] send_typing skipped: debounced, chat_id=%s elapsed=%.1fs "
+                "debounce=%ds (last sent %.1fs ago, will refresh after debounce window)",
+                self._log_tag,
+                chat_id,
+                elapsed,
+                self._TYPING_DEBOUNCE_SECONDS,
+                elapsed,
+            )
             return
 
         try:
@@ -3559,10 +3593,34 @@ class QQAdapter(BasePlatformAdapter):
                 },
                 "msg_seq": msg_seq,
             }
+            logger.debug(
+                "[%s] send_typing sending input_notify: chat_id=%s msg_id=%s "
+                "msg_seq=%s input_second=%d",
+                self._log_tag,
+                chat_id,
+                msg_id,
+                msg_seq,
+                self._TYPING_INPUT_SECONDS,
+            )
             await self._api_request("POST", f"/v2/users/{chat_id}/messages", body)
             self._typing_sent_at[chat_id] = now
+            logger.debug(
+                "[%s] send_typing succeeded: chat_id=%s msg_id=%s msg_seq=%s "
+                "(indicator will auto-expire in %ds)",
+                self._log_tag,
+                chat_id,
+                msg_id,
+                msg_seq,
+                self._TYPING_INPUT_SECONDS,
+            )
         except Exception as exc:
-            logger.debug("[%s] send_typing failed: %s", self._log_tag, exc)
+            logger.debug(
+                "[%s] send_typing failed: chat_id=%s msg_id=%s err=%s",
+                self._log_tag,
+                chat_id,
+                msg_id,
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # Format
