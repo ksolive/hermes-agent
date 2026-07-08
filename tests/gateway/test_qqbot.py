@@ -3183,9 +3183,13 @@ class TestC2CStreamingReply:
         assert len(calls) == api_calls_before  # no additional API call
 
     @pytest.mark.asyncio
-    async def test_group_chat_never_uses_stream_api(self):
-        """Group targets must fall through to the legacy send path even
-        when ``expect_edits`` is set — QQ's stream endpoint is C2C-only.
+    async def test_group_chat_streaming_first_send_is_suppressed(self):
+        """Group targets have no editable message id, so the streaming
+        first-send is short-circuited: no QQ API call, ``success=True``
+        with ``message_id=None``.  This drives the stream consumer into
+        its ``_fallback_final_send`` path, which delivers the complete
+        reply as a single message once the stream ends (via a follow-up
+        ``send()`` without ``expect_edits``).
         """
         adapter = self._make_adapter()
         adapter._chat_type_map["group_a"] = "group"
@@ -3203,8 +3207,59 @@ class TestC2CStreamingReply:
             metadata={"expect_edits": True},
         )
         assert result.success
-        assert all("/stream_messages" not in p for p in paths)
-        assert paths[0] == "/v2/groups/group_a/messages"
+        assert result.message_id is None
+        # No QQ API call happened — the reply is deferred to fallback-final.
+        assert paths == []
+
+    @pytest.mark.asyncio
+    async def test_guild_chat_streaming_first_send_is_suppressed(self):
+        """Same short-circuit as group chats — guild targets are also
+        non-editable, so ``expect_edits`` must not trigger a real send.
+        """
+        adapter = self._make_adapter()
+        adapter._chat_type_map["chan1"] = "guild"
+        paths = []
+
+        async def fake_api(method, path, body=None, **kw):
+            paths.append(path)
+            return {"id": "regular-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        result = await adapter.send(
+            "chan1", "hello",
+            reply_to="inbound_m1",
+            metadata={"expect_edits": True},
+        )
+        assert result.success
+        assert result.message_id is None
+        assert paths == []
+
+    @pytest.mark.asyncio
+    async def test_group_chat_without_expect_edits_sends_normally(self):
+        """Non-streaming group sends (including the follow-up call the
+        stream consumer makes from ``_send_fallback_final``) must still
+        hit the regular group messages endpoint and return a real id —
+        that's how the complete reply reaches the user in the end.
+        """
+        adapter = self._make_adapter()
+        adapter._chat_type_map["group_a"] = "group"
+        paths = []
+
+        async def fake_api(method, path, body=None, **kw):
+            paths.append(path)
+            return {"id": "regular-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        result = await adapter.send(
+            "group_a", "final answer",
+            reply_to="inbound_m1",
+            metadata={"final": True},  # fallback-final path: no expect_edits
+        )
+        assert result.success
+        assert result.message_id == "regular-1"
+        assert paths == ["/v2/groups/group_a/messages"]
 
     @pytest.mark.asyncio
     async def test_group_edit_message_returns_failure(self):

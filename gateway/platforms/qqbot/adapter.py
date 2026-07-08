@@ -2617,21 +2617,60 @@ class QQAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=True)
 
+        expect_edits = bool((metadata or {}).get("expect_edits"))
+        chat_type = self._guess_chat_type(chat_id)
+
         # Streaming fast-path: C2C + expect_edits + globally enabled.
-        # Groups and guilds are explicitly excluded — QQ's stream_messages
-        # endpoint rejects non-C2C targets, and the stream consumer
-        # already produces an acceptable "chunk-append" experience there
-        # via its regular per-tick send loop.
+        # QQ's ``stream_messages`` endpoint only accepts C2C targets, so
+        # group / guild replies take a different route (see below).
         if (
                 self._streaming_enabled
-                and bool((metadata or {}).get("expect_edits"))
-                and self._guess_chat_type(chat_id) == "c2c"
+                and expect_edits
+                and chat_type == "c2c"
         ):
             stream_result = await self._start_stream_reply(chat_id, content, reply_to)
             if stream_result is not None:
                 return stream_result
             # Falls through to the legacy path on start failure — the
             # helper has already emitted a warning log.
+
+        # Group / guild streaming: no editable message id.
+        #
+        # For group and guild targets QQ does not support in-place
+        # message edits, and the ``stream_messages`` endpoint is C2C
+        # only.  If we let the first-chunk ``send()`` deliver a real
+        # message here, the stream consumer would try to ``edit_message``
+        # on it for every subsequent tick, each edit would fail (no
+        # matching stream session), and consumer would fall back to a
+        # fresh ``send()`` — producing one QQ message per tick.  Users
+        # observe this as "the first chunk arrives immediately and then
+        # the rest of the answer arrives as one more full message",
+        # i.e. every group reply becomes two (or more) messages.
+        #
+        # To collapse that to a single, complete group reply we short-
+        # circuit the streaming first-send:
+        #
+        # * do NOT hit the QQ API here (nothing visible yet), and
+        # * return ``success=True`` with ``message_id=None``.
+        #
+        # ``gateway/stream_consumer.py`` treats a successful send with
+        # no message id as "editing not supported for this session":
+        # it sets ``_edit_supported = False`` + ``_fallback_final_send
+        # = True`` + ``_message_id = "__no_edit__"``, silently drops
+        # every intermediate edit, accumulates the streamed text, and
+        # once the stream completes calls ``_send_fallback_final``
+        # which invokes ``send()`` again — this time WITHOUT
+        # ``expect_edits`` — so we fall through to the legacy chunked
+        # path below and deliver ONE complete group message.
+        if expect_edits and chat_type in ("group", "guild"):
+            logger.debug(
+                "[%s] streaming first-send suppressed for %s chat %s: "
+                "group/guild has no editable message id, deferring the "
+                "entire reply to the fallback-final path (one complete "
+                "message once the stream ends)",
+                self._log_tag, chat_type, chat_id,
+            )
+            return SendResult(success=True, message_id=None)
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
