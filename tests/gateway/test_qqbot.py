@@ -2926,3 +2926,524 @@ class TestGroupContextIntegration:
         assert text.index("earlier") < text.index("see attached")
         assert text.index("see attached") < text.index("[file: doc.pdf]")
         assert "CONTEXT ONLY" in text
+
+
+# ---------------------------------------------------------------------------
+# C2C streaming reply — StreamManager
+# ---------------------------------------------------------------------------
+
+class TestStreamManager:
+    """Unit tests for the in-memory StreamSession table."""
+
+    def test_create_registers_session_with_generated_logical_id(self):
+        from gateway.platforms.qqbot.streaming import StreamManager
+        mgr = StreamManager()
+        s1 = mgr.create(openid="u1", passive_msg_id="m1", msg_seq=42)
+        s2 = mgr.create(openid="u2", passive_msg_id="m2", msg_seq=43)
+        assert s1.logical_id and s2.logical_id
+        assert s1.logical_id != s2.logical_id
+        assert mgr.get(s1.logical_id) is s1
+        assert mgr.get(s2.logical_id) is s2
+
+    def test_get_returns_none_for_unknown_id(self):
+        from gateway.platforms.qqbot.streaming import StreamManager
+        mgr = StreamManager()
+        assert mgr.get("nonexistent") is None
+
+    def test_drop_is_idempotent(self):
+        from gateway.platforms.qqbot.streaming import StreamManager
+        mgr = StreamManager()
+        s = mgr.create(openid="u", passive_msg_id="m", msg_seq=1)
+        mgr.drop(s.logical_id)
+        mgr.drop(s.logical_id)  # second drop must not raise
+        assert mgr.get(s.logical_id) is None
+
+    def test_ttl_expiry_evicts_stale_session(self):
+        from gateway.platforms.qqbot.streaming import StreamManager
+        mgr = StreamManager(ttl_seconds=60.0)
+        s = mgr.create(openid="u", passive_msg_id="m", msg_seq=1)
+        # Backdate the session past the TTL horizon.
+        s.created_at -= 61.0
+        assert mgr.get(s.logical_id) is None
+        # After the failed lookup the entry should be gone.
+        assert len(mgr) == 0
+
+    def test_lru_eviction_when_full(self):
+        from gateway.platforms.qqbot.streaming import StreamManager
+        mgr = StreamManager(max_sessions=2)
+        a = mgr.create(openid="a", passive_msg_id="m1", msg_seq=1)
+        b = mgr.create(openid="b", passive_msg_id="m2", msg_seq=2)
+        # Touch A to promote it — B becomes LRU.
+        assert mgr.get(a.logical_id) is a
+        mgr.create(openid="c", passive_msg_id="m3", msg_seq=3)
+        assert mgr.get(b.logical_id) is None  # evicted
+        assert mgr.get(a.logical_id) is a  # still present
+
+
+# ---------------------------------------------------------------------------
+# C2C streaming reply — QQAdapter integration
+# ---------------------------------------------------------------------------
+
+class TestC2CStreamingReply:
+    """Streaming-path tests for ``send()`` + ``edit_message()`` on C2C chats."""
+
+    def _make_adapter(self, **extra):
+        from gateway.platforms.qqbot import QQAdapter
+        extra.setdefault("app_id", "a")
+        extra.setdefault("client_secret", "b")
+        adapter = QQAdapter(_make_config(**extra))
+        adapter._running = True
+        adapter._ws = SimpleNamespace(closed=False)
+        adapter._http_client = mock.MagicMock()
+        return adapter
+
+    def test_requires_edit_finalize_class_attr_is_true(self):
+        from gateway.platforms.qqbot import QQAdapter
+        assert QQAdapter.REQUIRES_EDIT_FINALIZE is True
+
+    def test_streaming_defaults_enabled(self):
+        adapter = self._make_adapter()
+        assert adapter._streaming_enabled is True
+
+    def test_streaming_can_be_disabled_via_config(self):
+        adapter = self._make_adapter(streaming_enabled=False)
+        assert adapter._streaming_enabled is False
+
+    @pytest.mark.asyncio
+    async def test_c2c_first_send_opens_stream_session(self):
+        adapter = self._make_adapter()
+        adapter._chat_type_map["user_a"] = "c2c"
+        calls = []
+
+        async def fake_api(method, path, body=None, **kw):
+            calls.append((method, path, body))
+            return {"id": "stream-xyz-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        result = await adapter.send(
+            "user_a", "hello",
+            reply_to="inbound_m1",
+            metadata={"expect_edits": True},
+        )
+        assert result.success
+        # message_id must be the adapter's logical_id (opaque uuid hex),
+        # NOT the QQ-assigned stream_msg_id — the consumer echoes this
+        # back on edit_message and we translate internally.
+        assert result.message_id is not None
+        assert result.message_id != "stream-xyz-1"
+        assert len(calls) == 1
+        method, path, body = calls[0]
+        assert method == "POST"
+        assert path == "/v2/users/user_a/stream_messages"
+        assert body["input_mode"] == "replace"
+        assert body["input_state"] == 1  # GENERATING
+        assert body["content_type"] == "markdown"  # MARKDOWN — fixed
+        assert body["content_raw"] == "hello"
+        assert body["event_id"] == "inbound_m1"
+        assert body["msg_id"] == "inbound_m1"
+        assert body["index"] == 0
+        assert "stream_msg_id" not in body  # first chunk omits it
+        # Session should be registered and reference the QQ id.
+        session = adapter._stream_manager.get(result.message_id)
+        assert session is not None
+        assert session.stream_msg_id == "stream-xyz-1"
+
+    @pytest.mark.asyncio
+    async def test_c2c_edit_reuses_stream_msg_id_and_increments_index(self):
+        adapter = self._make_adapter()
+        adapter._chat_type_map["user_a"] = "c2c"
+        calls = []
+
+        async def fake_api(method, path, body=None, **kw):
+            calls.append((method, path, body))
+            return {"id": "stream-xyz-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        first = await adapter.send(
+            "user_a", "hel",
+            reply_to="inbound_m1",
+            metadata={"expect_edits": True},
+        )
+        assert first.success
+        logical_id = first.message_id
+
+        second = await adapter.edit_message("user_a", logical_id, "hello")
+        third = await adapter.edit_message("user_a", logical_id, "hello wor")
+        assert second.success and third.success
+        # All three chunks share the same msg_seq and target the same
+        # stream endpoint.
+        assert len({body["msg_seq"] for _, _, body in calls}) == 1
+        assert [body["index"] for _, _, body in calls] == [0, 1, 2]
+        # Second/third chunks carry stream_msg_id from the first response.
+        assert calls[1][2]["stream_msg_id"] == "stream-xyz-1"
+        assert calls[2][2]["stream_msg_id"] == "stream-xyz-1"
+        # content_raw is REPLACE semantics — full accumulated text each time.
+        assert [body["content_raw"] for _, _, body in calls] == [
+            "hel", "hello", "hello wor",
+        ]
+        # Intermediate edits stay in GENERATING state.
+        assert calls[1][2]["input_state"] == 1
+        assert calls[2][2]["input_state"] == 1
+
+    @pytest.mark.asyncio
+    async def test_c2c_finalize_sends_done_and_drops_session(self):
+        adapter = self._make_adapter()
+        adapter._chat_type_map["user_a"] = "c2c"
+        calls = []
+
+        async def fake_api(method, path, body=None, **kw):
+            calls.append((method, path, body))
+            return {"id": "stream-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        first = await adapter.send(
+            "user_a", "partial",
+            reply_to="inbound_m1",
+            metadata={"expect_edits": True},
+        )
+        result = await adapter.edit_message(
+            "user_a", first.message_id, "final full answer",
+            finalize=True,
+        )
+        assert result.success
+        # Final chunk uses input_state=10 (DONE).
+        assert calls[-1][2]["input_state"] == 10
+        # Session should be cleaned up after finalize.
+        assert adapter._stream_manager.get(first.message_id) is None
+
+    @pytest.mark.asyncio
+    async def test_edit_after_finalize_is_noop_success(self):
+        adapter = self._make_adapter()
+        adapter._chat_type_map["user_a"] = "c2c"
+
+        async def fake_api(method, path, body=None, **kw):
+            return {"id": "stream-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        first = await adapter.send(
+            "user_a", "x",
+            reply_to="inbound_m1",
+            metadata={"expect_edits": True},
+        )
+        await adapter.edit_message(
+            "user_a", first.message_id, "final",
+            finalize=True,
+        )
+        # Second call after finalize: session already dropped, treated
+        # as "unknown session" → success=False so the consumer sends a
+        # fresh message rather than corrupting the finalized stream.
+        r = await adapter.edit_message(
+            "user_a", first.message_id, "oops",
+        )
+        assert r.success is False
+        assert "expired" in (r.error or "").lower() or "found" in (r.error or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_edit_on_unknown_session_returns_failure(self):
+        adapter = self._make_adapter()
+        result = await adapter.edit_message("user_a", "nonexistent-logical-id", "hi")
+        assert result.success is False
+        assert result.error
+
+    @pytest.mark.asyncio
+    async def test_out_of_order_edit_is_dropped_silently(self):
+        """When ``next_index <= last_sent_index`` the edit is treated as a
+        no-op success without hitting the QQ API — matches the simplified
+        out-of-order policy agreed for this release.
+        """
+        adapter = self._make_adapter()
+        adapter._chat_type_map["user_a"] = "c2c"
+        calls = []
+
+        async def fake_api(method, path, body=None, **kw):
+            calls.append((method, path, body))
+            return {"id": "stream-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        first = await adapter.send(
+            "user_a", "hi",
+            reply_to="inbound_m1",
+            metadata={"expect_edits": True},
+        )
+        session = adapter._stream_manager.get(first.message_id)
+        # Simulate an out-of-order scenario by regressing next_index.
+        # (Consumer serialisation makes this impossible in practice, so
+        # we assert the defensive guard triggers when it happens.)
+        session.next_index = 0
+        session.last_sent_index = 0
+        api_calls_before = len(calls)
+
+        r = await adapter.edit_message("user_a", first.message_id, "hello")
+        assert r.success is True
+        assert len(calls) == api_calls_before  # no additional API call
+
+    @pytest.mark.asyncio
+    async def test_group_chat_never_uses_stream_api(self):
+        """Group targets must fall through to the legacy send path even
+        when ``expect_edits`` is set — QQ's stream endpoint is C2C-only.
+        """
+        adapter = self._make_adapter()
+        adapter._chat_type_map["group_a"] = "group"
+        paths = []
+
+        async def fake_api(method, path, body=None, **kw):
+            paths.append(path)
+            return {"id": "regular-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        result = await adapter.send(
+            "group_a", "hello",
+            reply_to="inbound_m1",
+            metadata={"expect_edits": True},
+        )
+        assert result.success
+        assert all("/stream_messages" not in p for p in paths)
+        assert paths[0] == "/v2/groups/group_a/messages"
+
+    @pytest.mark.asyncio
+    async def test_group_edit_message_returns_failure(self):
+        """Groups have no stream session — edit_message must return
+        ``success=False`` so the consumer falls back to a fresh send.
+        """
+        adapter = self._make_adapter()
+        result = await adapter.edit_message("group_a", "any-id", "hi")
+        assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_streaming_disabled_falls_back_to_legacy_send(self):
+        adapter = self._make_adapter(streaming_enabled=False)
+        adapter._chat_type_map["user_a"] = "c2c"
+        paths = []
+
+        async def fake_api(method, path, body=None, **kw):
+            paths.append(path)
+            return {"id": "regular-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        result = await adapter.send(
+            "user_a", "hi",
+            reply_to="inbound_m1",
+            metadata={"expect_edits": True},
+        )
+        assert result.success
+        assert all("/stream_messages" not in p for p in paths)
+
+    @pytest.mark.asyncio
+    async def test_c2c_send_without_expect_edits_uses_legacy_path(self):
+        adapter = self._make_adapter()
+        adapter._chat_type_map["user_a"] = "c2c"
+        paths = []
+
+        async def fake_api(method, path, body=None, **kw):
+            paths.append(path)
+            return {"id": "regular-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        result = await adapter.send("user_a", "hi", reply_to="inbound_m1")
+        assert result.success
+        assert paths == ["/v2/users/user_a/messages"]
+
+    @pytest.mark.asyncio
+    async def test_streaming_start_failure_falls_back_to_legacy(self, caplog):
+        """First chunk failure must warn and degrade to a regular send in
+        the same ``send()`` call — user requirement (d).
+        """
+        adapter = self._make_adapter()
+        adapter._chat_type_map["user_a"] = "c2c"
+        calls = []
+
+        async def fake_api(method, path, body=None, **kw):
+            calls.append(path)
+            if "/stream_messages" in path:
+                raise RuntimeError("QQ Bot API error [500] boom")
+            return {"id": "legacy-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        import logging
+        with caplog.at_level(logging.WARNING):
+            result = await adapter.send(
+                "user_a", "hi",
+                reply_to="inbound_m1",
+                metadata={"expect_edits": True},
+            )
+        assert result.success
+        # Stream attempt happened, then fell back to the regular endpoint.
+        assert calls[0].endswith("/stream_messages")
+        assert calls[-1] == "/v2/users/user_a/messages"
+        assert any(
+            "Failed to start C2C streaming reply" in rec.message
+            for rec in caplog.records
+        )
+        # Abandoned session must not leak into the manager table.
+        assert len(adapter._stream_manager) == 0
+
+    @pytest.mark.asyncio
+    async def test_streaming_start_without_passive_msg_id_falls_back(self, caplog):
+        """No reply_to + no cached inbound id → skip streaming with a
+        warning; the endpoint requires a passive-reply msg_id.
+        """
+        adapter = self._make_adapter()
+        adapter._chat_type_map["user_a"] = "c2c"
+        # _last_msg_id intentionally empty.
+        calls = []
+
+        async def fake_api(method, path, body=None, **kw):
+            calls.append(path)
+            return {"id": "legacy-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        import logging
+        with caplog.at_level(logging.WARNING):
+            result = await adapter.send(
+                "user_a", "hi",
+                metadata={"expect_edits": True},
+            )
+        assert result.success
+        assert all("/stream_messages" not in p for p in calls)
+        assert any("no passive msg_id" in rec.message for rec in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_streaming_uses_cached_inbound_id_when_reply_to_missing(self):
+        """If ``reply_to`` is not supplied, the adapter must use the most
+        recent inbound msg_id it saw for that chat.
+        """
+        adapter = self._make_adapter()
+        adapter._chat_type_map["user_a"] = "c2c"
+        adapter._last_msg_id["user_a"] = "cached_inbound_99"
+        calls = []
+
+        async def fake_api(method, path, body=None, **kw):
+            calls.append(body)
+            return {"id": "stream-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        result = await adapter.send(
+            "user_a", "hi",
+            metadata={"expect_edits": True},
+        )
+        assert result.success
+        assert calls[0]["msg_id"] == "cached_inbound_99"
+        assert calls[0]["event_id"] == "cached_inbound_99"
+
+    @pytest.mark.asyncio
+    async def test_content_truncated_to_stream_content_limit(self):
+        from gateway.platforms.qqbot.streaming import MAX_STREAM_CONTENT_LEN
+        adapter = self._make_adapter()
+        adapter._chat_type_map["user_a"] = "c2c"
+        captured = []
+
+        async def fake_api(method, path, body=None, **kw):
+            captured.append(body)
+            return {"id": "stream-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        big = "x" * (MAX_STREAM_CONTENT_LEN + 200)
+        await adapter.send(
+            "user_a", big,
+            reply_to="inbound_m1",
+            metadata={"expect_edits": True},
+        )
+        assert len(captured[0]["content_raw"]) == MAX_STREAM_CONTENT_LEN
+
+    @pytest.mark.asyncio
+    async def test_stream_forwards_content_verbatim_when_gateway_suppresses_cursor(self):
+        """With QQBOT-specific cursor suppression in ``gateway/run.py``
+        (analogous to ``Platform.MATRIX``), no typewriter cursor ever
+        reaches the adapter — successive frames are forwarded verbatim
+        and the prefix invariant holds naturally.
+        """
+        adapter = self._make_adapter()
+        adapter._chat_type_map["user_a"] = "c2c"
+        calls = []
+
+        async def fake_api(method, path, body=None, **kw):
+            calls.append(body)
+            return {"id": "stream-nocursor-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        # All three frames arrive without any trailing cursor glyph,
+        # exactly what the gateway will emit for QQBOT.
+        first = await adapter.send(
+            "user_a", "Hello",
+            reply_to="inbound_m1",
+            metadata={"expect_edits": True},
+        )
+        assert first.success
+        logical_id = first.message_id
+
+        second = await adapter.edit_message(
+            "user_a", logical_id, "Hello world",
+        )
+        assert second.success
+
+        third = await adapter.edit_message(
+            "user_a", logical_id, "Hello world!", finalize=True,
+        )
+        assert third.success
+
+        seen = [body["content_raw"] for body in calls]
+        assert seen == ["Hello", "Hello world", "Hello world!"]
+        for i in range(len(seen) - 1):
+            assert seen[i + 1].startswith(seen[i]), (
+                f"prefix broken at {i}: {seen[i]!r} -> {seen[i + 1]!r}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_stream_prefix_divergence_replays_last_chunk(self):
+        """Divergent frames must degrade to a safe replay, not a 500.
+
+        If a subsequent edit's cleaned text does NOT start with the
+        previously-accepted text (e.g. upstream trimmed a segment,
+        replayed a shorter partial, or the model backtracked), we
+        MUST NOT forward it verbatim — that would break the prefix
+        invariant and kill the whole stream.  Instead the adapter
+        replays the last-accepted text so QQ sees a no-op-shaped
+        chunk and the session stays alive for the next real update.
+        """
+        adapter = self._make_adapter()
+        adapter._chat_type_map["user_a"] = "c2c"
+        calls = []
+
+        async def fake_api(method, path, body=None, **kw):
+            calls.append(body)
+            return {"id": "stream-div-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        first = await adapter.send(
+            "user_a", "Hello world how are you",
+            reply_to="inbound_m1",
+            metadata={"expect_edits": True},
+        )
+        assert first.success
+        logical_id = first.message_id
+
+        # Divergent frame — shorter and NOT a prefix of the first.
+        result = await adapter.edit_message(
+            "user_a", logical_id, "Different content entirely",
+        )
+        # We report success (from QQ's POV nothing bad happened) but the
+        # payload we actually sent is the previously-accepted text,
+        # keeping the prefix invariant intact.
+        assert result.success
+        assert calls[1]["content_raw"] == "Hello world how are you"
+
+        # A subsequent, properly-extended frame flows through as normal.
+        third = await adapter.edit_message(
+            "user_a", logical_id, "Hello world how are you today",
+        )
+        assert third.success
+        assert calls[2]["content_raw"] == "Hello world how are you today"

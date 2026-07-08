@@ -60,7 +60,10 @@ except ImportError:
     HTTPX_AVAILABLE = False
     httpx = None  # type: ignore[assignment]
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import (
+    Platform,
+    PlatformConfig,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -142,6 +145,12 @@ from gateway.platforms.qqbot.group_context import (
     GroupContextBuffer,
     summarize_attachments,
 )
+from gateway.platforms.qqbot.streaming import (
+    DEFAULT_SESSION_TTL_SECONDS,
+    MAX_STREAM_CONTENT_LEN,
+    StreamManager,
+    StreamSession,
+)
 
 
 def check_qq_requirements() -> bool:
@@ -162,8 +171,28 @@ def _coerce_list(value: Any) -> List[str]:
 class QQAdapter(BasePlatformAdapter):
     """QQ Bot adapter backed by the official QQ Bot WebSocket Gateway + REST API."""
 
-    # QQ Bot API does not support editing sent messages.
-    SUPPORTS_MESSAGE_EDITING = False
+    # QQ Bot API does not support editing regular sent messages, but the
+    # C2C stream_messages endpoint (used for streaming replies to private
+    # chats) DOES accept in-place updates for the same ``stream_msg_id``.
+    #
+    # We advertise ``SUPPORTS_MESSAGE_EDITING = True`` so the gateway
+    # stream consumer is willing to attach for C2C sessions.  The actual
+    # gating happens inside :meth:`edit_message`: if no C2C stream
+    # session is registered for the given ``message_id`` (which is the
+    # case for group / guild replies), we return
+    # ``SendResult(success=False, error="stream session not found …")``
+    # and the stream consumer falls back to a fresh ``send()`` — so
+    # non-C2C paths still get plain "send new message" semantics.
+    SUPPORTS_MESSAGE_EDITING = True
+
+    # Streaming replies to QQ AI-assistant surfaces stay in a "generating"
+    # visual state until the caller sends ``input_state=10 (DONE)``.  The
+    # stream consumer honours this flag by routing a final edit through
+    # even when content is unchanged, ensuring the UI transitions out of
+    # the streaming indicator.  Group / guild replies fall back to plain
+    # sends so this only affects C2C, where it's required.
+    REQUIRES_EDIT_FINALIZE = True
+
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     _TYPING_INPUT_SECONDS = 60  # input_notify duration reported to QQ
     _TYPING_DEBOUNCE_SECONDS = 50  # refresh before it expires
@@ -263,6 +292,19 @@ class QQAdapter(BasePlatformAdapter):
         # group_history_limit <= 0 disables buffering.
         self._group_history_limit = int(extra.get("group_history_limit", 20))
         self._group_context = GroupContextBuffer(limit=self._group_history_limit)
+
+        # ── C2C streaming reply ─────────────────────────────────────────
+        # QQ's official ``stream_messages`` endpoint is C2C-only (see
+        # openclaw ``shouldUseOfficialC2cStream`` which hard-rejects
+        # non-C2C targets).  We enable it by default because failures
+        # gracefully fall back to fresh sends via the stream consumer's
+        # own error-handling; a config knob is exposed for operators who
+        # want to force the legacy path (e.g. during incident triage).
+        self._streaming_enabled = bool(extra.get("streaming_enabled", True))
+        self._stream_session_ttl = float(
+            extra.get("streaming_session_ttl_seconds", DEFAULT_SESSION_TTL_SECONDS)
+        )
+        self._stream_manager = StreamManager(ttl_seconds=self._stream_session_ttl)
 
         # Connection state
         self._session: Optional[aiohttp.ClientSession] = None
@@ -2558,15 +2600,38 @@ class QQAdapter(BasePlatformAdapter):
 
         Applies format_message(), splits long messages via truncate_message(),
         and retries transient failures with exponential backoff.
-        """
-        del metadata
 
+        When the caller signals a streaming reply (``metadata.expect_edits``)
+        and the target is a C2C chat, the first chunk is delivered through
+        QQ's native ``stream_messages`` endpoint instead of the regular
+        ``/messages`` API.  The returned ``SendResult.message_id`` is an
+        adapter-generated opaque handle (``StreamSession.logical_id``); the
+        stream consumer uses it in follow-up ``edit_message`` calls.  On
+        streaming-start failure we log a warning and fall through to the
+        legacy path so the user still receives an answer.
+        """
         if not self.is_connected:
             if not await self._wait_for_reconnection():
                 return SendResult(success=False, error="Not connected", retryable=True)
 
         if not content or not content.strip():
             return SendResult(success=True)
+
+        # Streaming fast-path: C2C + expect_edits + globally enabled.
+        # Groups and guilds are explicitly excluded — QQ's stream_messages
+        # endpoint rejects non-C2C targets, and the stream consumer
+        # already produces an acceptable "chunk-append" experience there
+        # via its regular per-tick send loop.
+        if (
+                self._streaming_enabled
+                and bool((metadata or {}).get("expect_edits"))
+                and self._guess_chat_type(chat_id) == "c2c"
+        ):
+            stream_result = await self._start_stream_reply(chat_id, content, reply_to)
+            if stream_result is not None:
+                return stream_result
+            # Falls through to the legacy path on start failure — the
+            # helper has already emitted a warning log.
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
@@ -2687,6 +2752,292 @@ class QQAdapter(BasePlatformAdapter):
         data = await self._api_request("POST", f"/channels/{channel_id}/messages", body)
         msg_id = str(data.get("id", uuid.uuid4().hex[:12]))
         return SendResult(success=True, message_id=msg_id, raw_response=data)
+
+    # ------------------------------------------------------------------
+    # C2C streaming reply (POST /v2/users/{openid}/stream_messages)
+    # ------------------------------------------------------------------
+
+    async def _start_stream_reply(
+            self,
+            openid: str,
+            content: str,
+            reply_to: Optional[str],
+    ) -> Optional[SendResult]:
+        """Open a C2C streaming session and send the first chunk.
+
+        Returns a successful :class:`SendResult` whose ``message_id`` is
+        the adapter's opaque ``logical_id`` on success.  On failure
+        returns ``None`` (a warning is logged) so the caller can fall
+        back to the legacy send path — per user requirement (d): first
+        chunk failure degrades to a normal message within the same
+        ``send()`` call to minimise user-visible latency.
+        """
+        # QQ's stream_messages endpoint requires a valid passive-reply
+        # msg_id (event_id is the same value in openclaw's mapping).  If
+        # the consumer hasn't provided reply_to, fall back to the most
+        # recent inbound id we've seen for this chat.  With no passive
+        # id we cannot start streaming — return None to trigger legacy
+        # fallback rather than making a request we know will fail.
+        passive_msg_id = reply_to or self._last_msg_id.get(openid)
+        if not passive_msg_id:
+            logger.warning(
+                "[%s] Streaming reply skipped for %s: no passive msg_id available; "
+                "falling back to regular send",
+                self._log_tag, openid,
+            )
+            return None
+
+        session = self._stream_manager.create(
+            openid=openid,
+            passive_msg_id=passive_msg_id,
+            msg_seq=self._next_msg_seq(passive_msg_id),
+        )
+        # First chunk has no prior text to reconcile against and the
+        # gateway suppresses the typewriter cursor for QQBOT (see
+        # ``gateway/run.py`` ``_effective_cursor`` handling), so we
+        # forward ``content`` verbatim.
+        try:
+            resp = await self._call_stream_api(
+                session, content, input_state=1,
+            )
+        except Exception as exc:
+            # Purge the abandoned session so its logical_id can't leak
+            # into an ``edit_message`` lookup later.
+            self._stream_manager.drop(session.logical_id)
+            logger.warning(
+                "[%s] Failed to start C2C streaming reply for %s "
+                "(passive_msg_id=%s): %s — falling back to regular send",
+                self._log_tag, openid, passive_msg_id, exc,
+            )
+            return None
+
+        stream_msg_id = resp.get("id") if isinstance(resp, dict) else None
+        if not stream_msg_id:
+            self._stream_manager.drop(session.logical_id)
+            logger.warning(
+                "[%s] Streaming reply for %s: response missing 'id' field "
+                "(resp=%r); falling back to regular send",
+                self._log_tag, openid, resp,
+            )
+            return None
+
+        session.stream_msg_id = str(stream_msg_id)
+        session.last_sent_index = session.next_index
+        session.last_sent_content = content[:MAX_STREAM_CONTENT_LEN]
+        session.next_index += 1
+        logger.debug(
+            "[%s] C2C streaming reply started: logical_id=%s stream_msg_id=%s",
+            self._log_tag, session.logical_id, session.stream_msg_id,
+        )
+        return SendResult(
+            success=True,
+            message_id=session.logical_id,
+            raw_response=resp,
+        )
+
+    async def edit_message(
+            self,
+            chat_id: str,
+            message_id: str,
+            content: str,
+            *,
+            finalize: bool = False,
+    ) -> SendResult:
+        """Edit a streamed C2C reply by appending a chunk.
+
+        Only C2C streaming sessions are supported — for group / guild
+        replies (or any ``message_id`` we don't recognise) we return
+        ``success=False`` so the stream consumer falls back to a fresh
+        ``send()``.  Content is treated as the full accumulated text
+        (``input_mode=replace`` semantics on the QQ side), matching the
+        hermes base ``edit_message`` contract of "replace the message
+        with this content".
+
+        For the simplified out-of-order policy agreed for this release,
+        the adapter tracks the last successfully-sent ``index`` and
+        silently drops any edit that arrives out of sequence (reports
+        ``success=True`` without invoking QQ, so the consumer keeps its
+        internal cursor advancing).  In practice the consumer awaits
+        each edit serially, so this branch is defensive only.
+        """
+        del chat_id  # Session lookup is by logical_id, chat is implied.
+
+        session = self._stream_manager.get(message_id)
+        if session is None:
+            # Unknown / expired session: the consumer will re-send from
+            # scratch on the next tick.  This also covers group / guild
+            # ``edit_message`` calls — those never have a matching
+            # session because ``send()`` never opened one for them.
+            return SendResult(
+                success=False,
+                error="stream session not found or expired",
+            )
+
+        if session.finalized:
+            # Idempotent no-op — protects against double-DONE which
+            # would confuse QQ (index would regress from its POV).
+            logger.debug(
+                "[%s] edit_message on already-finalized session %s ignored",
+                self._log_tag, message_id,
+            )
+            return SendResult(success=True, message_id=message_id)
+
+        # Defensive out-of-order guard.  next_index tracks what we're
+        # about to send; last_sent_index tracks what QQ has already
+        # accepted.  next_index <= last_sent_index means we've already
+        # sent something at or past this position, which shouldn't
+        # happen with a serial consumer — treat as a no-op success.
+        my_index = session.next_index
+        if my_index <= session.last_sent_index:
+            logger.debug(
+                "[%s] out-of-order stream chunk dropped: my_index=%d last_sent=%d",
+                self._log_tag, my_index, session.last_sent_index,
+            )
+            return SendResult(success=True, message_id=message_id)
+
+        input_state = 10 if finalize else 1
+        outgoing = self._enforce_stream_prefix(session, content)
+        try:
+            resp = await self._call_stream_api(
+                session, outgoing, input_state=input_state,
+            )
+        except Exception as exc:
+            error_str = str(exc)
+            retryable = not any(
+                kw in error_str.lower()
+                for kw in ("invalid", "forbidden", "not found", "bad request")
+            )
+            logger.warning(
+                "[%s] Stream edit failed (logical_id=%s stream_msg_id=%s "
+                "index=%d finalize=%s): %s",
+                self._log_tag, message_id, session.stream_msg_id,
+                my_index, finalize, exc,
+            )
+            # On terminal failures purge the session so subsequent edits
+            # get a fresh ``success=False`` fast instead of retrying
+            # against a broken stream.
+            if not retryable:
+                self._stream_manager.drop(message_id)
+            return SendResult(success=False, error=error_str, retryable=retryable)
+
+        session.last_sent_index = my_index
+        session.last_sent_content = outgoing[:MAX_STREAM_CONTENT_LEN]
+        session.next_index += 1
+        if finalize:
+            session.finalized = True
+            self._stream_manager.drop(message_id)
+        return SendResult(
+            success=True,
+            message_id=message_id,
+            raw_response=resp,
+        )
+
+    # ------------------------------------------------------------------
+    # Stream content prefix guard
+    # ------------------------------------------------------------------
+    #
+    # QQ's ``stream_messages`` endpoint uses ``input_mode=replace`` which
+    # means each chunk carries the FULL accumulated text and QQ verifies
+    # that the new text starts with the previously accepted text.  Two
+    # upstream behaviours can break that invariant:
+    #
+    # 1. **Typewriter cursor.**  ``GatewayStreamConsumer`` appends a
+    #    configurable "typing" cursor (``streaming.cursor``) to every
+    #    intermediate frame.  On QQBOT we suppress that injection at
+    #    the source — ``gateway/run.py`` sets ``_effective_cursor = ""``
+    #    for ``Platform.QQBOT`` (same treatment as ``Platform.MATRIX``),
+    #    so no cursor glyph ever reaches this adapter and there is
+    #    nothing to reverse-strip here.
+    #
+    # 2. **Occasional shorter frames / trims.**  A rare edge is a
+    #    frame that is shorter than the previous one (retries, dedupe
+    #    after a re-emit, model backtrack).  Sending that verbatim
+    #    triggers "系统繁忙" (HTTP 500) and permanently breaks the
+    #    stream — QQ won't accept any further chunk on the same
+    #    ``stream_msg_id``.  We defend against that by forcing each new
+    #    chunk to start with ``session.last_sent_content``; if it does
+    #    not, we replay the previously-accepted text so QQ sees a
+    #    no-op-shaped chunk instead of a rejection.
+
+    def _enforce_stream_prefix(
+            self, session: StreamSession, content: str,
+    ) -> str:
+        """Return a version of ``content`` safe to send on this session.
+
+        The returned text is guaranteed to start with
+        ``session.last_sent_content`` (the prefix invariant QQ enforces
+        server-side).  If ``content`` does not satisfy that invariant
+        (upstream trimmed the frame or the model backtracked), we log a
+        warning and fall back to the previously-accepted text — QQ will
+        treat the resulting chunk as a stylistic no-op and the stream
+        stays alive for the next real update.
+        """
+        last = session.last_sent_content
+        if not last:
+            # First edit after the initial send failed to record content
+            # (shouldn't happen — ``_start_stream_reply`` always writes
+            # ``last_sent_content`` on success), just forward as-is.
+            return content
+        if content.startswith(last):
+            return content
+        # Divergence: either the new frame is shorter (upstream trimmed
+        # or replayed a smaller partial) or its prefix drifted.  Replay
+        # ``last`` so we don't get rejected — the next tick will bring a
+        # longer frame that properly extends it.
+        logger.warning(
+            "[%s] stream prefix divergence on session %s "
+            "(last_len=%d new_len=%d); replaying last chunk to keep "
+            "QQ session alive",
+            self._log_tag, session.logical_id,
+            len(last), len(content),
+        )
+        return last
+
+    async def _call_stream_api(
+            self,
+            session: StreamSession,
+            content: str,
+            *,
+            input_state: int,
+    ) -> Dict[str, Any]:
+        """POST one chunk to ``/v2/users/{openid}/stream_messages``.
+
+        Body fields mirror the shape openclaw uses (see
+        ``streaming-c2c.ts`` ``sendStreamChunk``):
+
+        - ``input_mode="replace"`` — every call carries the full
+          accumulated text.  QQ's Go backend unmarshals this into a
+          ``string`` field, so numeric enum values (``1``) are rejected
+          with ``json: cannot unmarshal number into Go value of type
+          string``.  Use the string form.
+        - ``content_type="markdown"`` — fixed per operator requirement;
+          same string-vs-number caveat as ``input_mode``.  QQ markdown
+          gracefully renders plain-text bodies too.
+        - ``event_id`` reuses ``passive_msg_id`` (matches openclaw's
+          ``eventId: event.messageId``)
+        - ``msg_seq`` is session-wide constant; ``index`` post-increments
+
+        First-chunk requests omit ``stream_msg_id`` — the response body
+        carries the platform-assigned id.  Subsequent chunks must include
+        it or QQ will treat them as a new stream.
+        """
+        body: Dict[str, Any] = {
+            "input_mode": "replace",  # REPLACE — string, not numeric enum.
+            "input_state": input_state,
+            "content_type": "markdown",  # MARKDOWN — string, not numeric enum.
+            "content_raw": content[:MAX_STREAM_CONTENT_LEN],
+            "event_id": session.passive_msg_id,
+            "msg_id": session.passive_msg_id,
+            "msg_seq": session.msg_seq,
+            "index": session.next_index,
+        }
+        if session.stream_msg_id:
+            body["stream_msg_id"] = session.stream_msg_id
+        return await self._api_request(
+            "POST",
+            f"/v2/users/{session.openid}/stream_messages",
+            body,
+        )
 
     # ------------------------------------------------------------------
     # Inline-keyboard outbound helpers (approval / update-prompt flows)
