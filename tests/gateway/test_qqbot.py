@@ -3183,13 +3183,14 @@ class TestC2CStreamingReply:
         assert len(calls) == api_calls_before  # no additional API call
 
     @pytest.mark.asyncio
-    async def test_group_chat_streaming_first_send_is_suppressed(self):
-        """Group targets have no editable message id, so the streaming
-        first-send is short-circuited: no QQ API call, ``success=True``
-        with ``message_id=None``.  This drives the stream consumer into
-        its ``_fallback_final_send`` path, which delivers the complete
-        reply as a single message once the stream ends (via a follow-up
-        ``send()`` without ``expect_edits``).
+    async def test_group_chat_streaming_first_send_defers_delivery(self):
+        """Group targets have no editable message id on QQ, so the
+        streaming first-send is buffered inside the adapter: no QQ API
+        call yet, but ``send()`` returns ``success=True`` with a
+        sentinel ``message_id`` so the stream consumer stays on its
+        edit path (avoiding the lossy prefix-based fallback).  The
+        complete reply is delivered later, on ``edit_message`` with
+        ``finalize=True``.
         """
         adapter = self._make_adapter()
         adapter._chat_type_map["group_a"] = "group"
@@ -3207,13 +3208,21 @@ class TestC2CStreamingReply:
             metadata={"expect_edits": True},
         )
         assert result.success
-        assert result.message_id is None
-        # No QQ API call happened — the reply is deferred to fallback-final.
+        assert result.message_id is not None
+        assert result.message_id.startswith("__qqbot_group_defer_")
+        # No QQ API call happened — the reply is deferred to finalize.
         assert paths == []
+        # Session bookkeeping preserves the original reply_to for
+        # threaded delivery on finalize.
+        assert result.message_id in adapter._group_defer_sessions
+        session = adapter._group_defer_sessions[result.message_id]
+        assert session["chat_id"] == "group_a"
+        assert session["chat_type"] == "group"
+        assert session["reply_to"] == "inbound_m1"
 
     @pytest.mark.asyncio
-    async def test_guild_chat_streaming_first_send_is_suppressed(self):
-        """Same short-circuit as group chats — guild targets are also
+    async def test_guild_chat_streaming_first_send_defers_delivery(self):
+        """Same deferral as group chats — guild targets are also
         non-editable, so ``expect_edits`` must not trigger a real send.
         """
         adapter = self._make_adapter()
@@ -3232,15 +3241,136 @@ class TestC2CStreamingReply:
             metadata={"expect_edits": True},
         )
         assert result.success
-        assert result.message_id is None
+        assert result.message_id is not None
+        assert result.message_id.startswith("__qqbot_group_defer_")
         assert paths == []
+        session = adapter._group_defer_sessions[result.message_id]
+        assert session["chat_type"] == "guild"
+
+    @pytest.mark.asyncio
+    async def test_group_deferred_edit_intermediate_is_noop(self):
+        """Intermediate ``edit_message`` calls on a deferred group
+        session must NOT hit the QQ API — they are silent no-ops that
+        accumulate context until the finalize call arrives.
+        """
+        adapter = self._make_adapter()
+        adapter._chat_type_map["group_a"] = "group"
+        paths = []
+
+        async def fake_api(method, path, body=None, **kw):
+            paths.append(path)
+            return {"id": "regular-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        first = await adapter.send(
+            "group_a", "chunk1",
+            reply_to="inbound_m1",
+            metadata={"expect_edits": True},
+        )
+        sentinel = first.message_id
+        assert paths == []
+
+        for partial in ("chunk1 chunk2", "chunk1 chunk2 chunk3"):
+            r = await adapter.edit_message(
+                "group_a", sentinel, partial, finalize=False,
+            )
+            assert r.success
+            assert r.message_id == sentinel
+
+        # Still no QQ API traffic.
+        assert paths == []
+        # Session is still live.
+        assert sentinel in adapter._group_defer_sessions
+
+    @pytest.mark.asyncio
+    async def test_group_deferred_edit_finalize_delivers_full_content(self):
+        """The finalize ``edit_message`` is where the complete reply
+        actually reaches QQ.  It must:
+
+        * hit the regular group messages endpoint exactly once,
+        * carry the FULL accumulated content (not just the tail),
+        * preserve the original ``reply_to`` for threading, and
+        * clear the deferred session bookkeeping.
+        """
+        adapter = self._make_adapter()
+        adapter._chat_type_map["group_a"] = "group"
+        calls = []
+
+        async def fake_api(method, path, body=None, **kw):
+            calls.append((method, path, body))
+            return {"id": "regular-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        first = await adapter.send(
+            "group_a", "hello",
+            reply_to="inbound_m1",
+            metadata={"expect_edits": True},
+        )
+        sentinel = first.message_id
+        # A couple of intermediate edits — should not touch QQ.
+        await adapter.edit_message("group_a", sentinel, "hello world")
+        await adapter.edit_message(
+            "group_a", sentinel, "hello world, done",
+        )
+        assert calls == []
+
+        # Finalize with the full accumulated text.
+        final = await adapter.edit_message(
+            "group_a", sentinel,
+            "hello world, done: final answer",
+            finalize=True,
+        )
+        assert final.success
+        assert final.message_id == "regular-1"
+        # One and only one API call — the complete reply.
+        assert len(calls) == 1
+        method, path, body = calls[0]
+        assert method == "POST"
+        assert path == "/v2/groups/group_a/messages"
+        # Full accumulated text (may be under ``content`` or
+        # ``markdown.content`` depending on adapter markdown mode).
+        text = (
+            body.get("content")
+            or body.get("markdown", {}).get("content")
+            or ""
+        )
+        assert text.startswith("hello world, done: final answer")
+        # Threaded to the original inbound message.
+        assert body.get("msg_id") == "inbound_m1"
+        # Session bookkeeping cleaned up.
+        assert sentinel not in adapter._group_defer_sessions
+
+    @pytest.mark.asyncio
+    async def test_group_deferred_edit_after_session_expiry_recovers(self):
+        """If the deferred session is gone (adapter restart, TTL, ...),
+        a finalize edit must still deliver the content via a fresh
+        legacy send instead of dropping the reply silently.
+        """
+        adapter = self._make_adapter()
+        adapter._chat_type_map["group_a"] = "group"
+        calls = []
+
+        async def fake_api(method, path, body=None, **kw):
+            calls.append((method, path, body))
+            return {"id": "regular-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        # Never called send() first: no session exists.
+        result = await adapter.edit_message(
+            "group_a", "__qqbot_group_defer_missing__",
+            "recovered content", finalize=True,
+        )
+        assert result.success
+        assert len(calls) == 1
+        assert calls[0][1] == "/v2/groups/group_a/messages"
 
     @pytest.mark.asyncio
     async def test_group_chat_without_expect_edits_sends_normally(self):
-        """Non-streaming group sends (including the follow-up call the
-        stream consumer makes from ``_send_fallback_final``) must still
-        hit the regular group messages endpoint and return a real id —
-        that's how the complete reply reaches the user in the end.
+        """Non-streaming group sends must still hit the regular group
+        messages endpoint and return a real id.
         """
         adapter = self._make_adapter()
         adapter._chat_type_map["group_a"] = "group"
@@ -3255,7 +3385,7 @@ class TestC2CStreamingReply:
         result = await adapter.send(
             "group_a", "final answer",
             reply_to="inbound_m1",
-            metadata={"final": True},  # fallback-final path: no expect_edits
+            metadata={"final": True},
         )
         assert result.success
         assert result.message_id == "regular-1"

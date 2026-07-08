@@ -306,6 +306,22 @@ class QQAdapter(BasePlatformAdapter):
         )
         self._stream_manager = StreamManager(ttl_seconds=self._stream_session_ttl)
 
+        # Deferred streaming sessions for group / guild chats.
+        #
+        # QQ has no editable-message API for group or guild targets, and
+        # its ``stream_messages`` endpoint is C2C-only.  To avoid the
+        # "two messages per turn" symptom described in
+        # ``send()``/``edit_message()``, we intercept the streaming
+        # first-send for group/guild chats: we don't hit the QQ API on
+        # ``send()``, we hand out a sentinel ``message_id``, and we
+        # buffer subsequent ``edit_message()`` updates locally until the
+        # stream consumer calls with ``finalize=True`` — at that point
+        # we deliver ONE complete reply via the normal legacy path.
+        #
+        # ``sentinel_id -> {"chat_id", "chat_type", "reply_to"}``
+        # Entries are removed on finalize / drop.
+        self._group_defer_sessions: Dict[str, Dict[str, Any]] = {}
+
         # Connection state
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
@@ -2634,43 +2650,43 @@ class QQAdapter(BasePlatformAdapter):
             # Falls through to the legacy path on start failure — the
             # helper has already emitted a warning log.
 
-        # Group / guild streaming: no editable message id.
+        # Group / guild streaming: no editable message id on QQ side.
         #
         # For group and guild targets QQ does not support in-place
         # message edits, and the ``stream_messages`` endpoint is C2C
-        # only.  If we let the first-chunk ``send()`` deliver a real
-        # message here, the stream consumer would try to ``edit_message``
-        # on it for every subsequent tick, each edit would fail (no
-        # matching stream session), and consumer would fall back to a
-        # fresh ``send()`` — producing one QQ message per tick.  Users
-        # observe this as "the first chunk arrives immediately and then
-        # the rest of the answer arrives as one more full message",
-        # i.e. every group reply becomes two (or more) messages.
+        # only.  If we let the streaming first-send deliver a real
+        # message here, the stream consumer would try ``edit_message``
+        # on it for every subsequent tick — each edit fails, and the
+        # consumer's fallback re-sends the full accumulated text as a
+        # brand-new message.  Users then see the first chunk followed
+        # by the complete answer, i.e. two messages per turn.
         #
-        # To collapse that to a single, complete group reply we short-
-        # circuit the streaming first-send:
+        # To collapse that to a single complete reply we:
         #
-        # * do NOT hit the QQ API here (nothing visible yet), and
-        # * return ``success=True`` with ``message_id=None``.
-        #
-        # ``gateway/stream_consumer.py`` treats a successful send with
-        # no message id as "editing not supported for this session":
-        # it sets ``_edit_supported = False`` + ``_fallback_final_send
-        # = True`` + ``_message_id = "__no_edit__"``, silently drops
-        # every intermediate edit, accumulates the streamed text, and
-        # once the stream completes calls ``_send_fallback_final``
-        # which invokes ``send()`` again — this time WITHOUT
-        # ``expect_edits`` — so we fall through to the legacy chunked
-        # path below and deliver ONE complete group message.
+        #   1. buffer the streaming session inside the adapter,
+        #   2. hand out a sentinel ``message_id`` so the consumer
+        #      stays on its edit path (avoiding the multi-send
+        #      fallback machinery — including its lossy prefix-based
+        #      continuation logic which would drop the first chunk),
+        #   3. no-op every ``edit_message`` (see ``edit_message``
+        #      below), and
+        #   4. on the final ``edit_message(finalize=True)``, send ONE
+        #      complete message via the regular legacy path (which
+        #      handles chunking, keyboards, retries etc. correctly).
         if expect_edits and chat_type in ("group", "guild"):
+            sentinel_id = f"__qqbot_group_defer_{uuid.uuid4().hex}__"
+            self._group_defer_sessions[sentinel_id] = {
+                "chat_id": chat_id,
+                "chat_type": chat_type,
+                "reply_to": reply_to,
+            }
             logger.debug(
-                "[%s] streaming first-send suppressed for %s chat %s: "
-                "group/guild has no editable message id, deferring the "
-                "entire reply to the fallback-final path (one complete "
-                "message once the stream ends)",
-                self._log_tag, chat_type, chat_id,
+                "[%s] streaming first-send buffered for %s chat %s "
+                "(sentinel=%s): the complete reply will be delivered "
+                "on finalize",
+                self._log_tag, chat_type, chat_id, sentinel_id,
             )
-            return SendResult(success=True, message_id=None)
+            return SendResult(success=True, message_id=sentinel_id)
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
@@ -2882,10 +2898,23 @@ class QQAdapter(BasePlatformAdapter):
             *,
             finalize: bool = False,
     ) -> SendResult:
-        """Edit a streamed C2C reply by appending a chunk.
+        """Edit a streamed reply.
 
-        Only C2C streaming sessions are supported — for group / guild
-        replies (or any ``message_id`` we don't recognise) we return
+        Two flavours are supported:
+
+        * **C2C streaming sessions** (``message_id`` matches an entry
+          in ``_stream_manager``): forwarded to QQ's ``stream_messages``
+          endpoint as an append.
+        * **Group / guild deferred sessions** (``message_id`` starts
+          with ``__qqbot_group_defer_``): buffered locally.  Non-final
+          edits are silent no-ops; on ``finalize=True`` the accumulated
+          text is delivered as ONE complete message via the regular
+          legacy send path (chunking, keyboards, retries all handled by
+          the standard ``send()``).  This collapses what would otherwise
+          become two-plus messages per turn — see ``send()`` for the
+          full rationale.
+
+        For any other unrecognised ``message_id`` we return
         ``success=False`` so the stream consumer falls back to a fresh
         ``send()``.  Content is treated as the full accumulated text
         (``input_mode=replace`` semantics on the QQ side), matching the
@@ -2899,6 +2928,54 @@ class QQAdapter(BasePlatformAdapter):
         internal cursor advancing).  In practice the consumer awaits
         each edit serially, so this branch is defensive only.
         """
+        # Group / guild deferred session: accumulate silently, flush
+        # on finalize.  ``content`` here is the FULL accumulated text
+        # for this tick (per the base edit_message contract).
+        if message_id and message_id.startswith("__qqbot_group_defer_"):
+            defer = self._group_defer_sessions.get(message_id)
+            if defer is None:
+                # Session expired or already flushed — fresh-send the
+                # content so the user still gets a reply.  Falls
+                # through to the regular ``send()`` path (no
+                # expect_edits → legacy chunked delivery).
+                logger.warning(
+                    "[%s] deferred group session %s missing on edit "
+                    "(finalize=%s); recovering via fresh send to %s",
+                    self._log_tag, message_id, finalize, chat_id,
+                )
+                if not finalize:
+                    # Nothing to do until finalize — the consumer will
+                    # call us again with the full text.
+                    return SendResult(success=True, message_id=message_id)
+                return await self.send(chat_id, content, reply_to=None)
+
+            if not finalize:
+                # Silent no-op: the next edit (or the finalize edit)
+                # will carry the newer accumulated text.  We do NOT
+                # store ``content`` here — the consumer always sends
+                # the full text on every edit call, so the finalize
+                # payload is authoritative.
+                return SendResult(success=True, message_id=message_id)
+
+            # Finalize: deliver ONE complete reply via the legacy
+            # (non-streaming) send path, using the reply_to captured
+            # at ``send()`` time so threading is preserved.
+            defer_chat_id = defer.get("chat_id") or chat_id
+            reply_to = defer.get("reply_to")
+            # Drop the session BEFORE the send so a re-entrant edit
+            # (shouldn't happen, but defensive) doesn't double-send.
+            self._group_defer_sessions.pop(message_id, None)
+            result = await self.send(
+                defer_chat_id, content, reply_to=reply_to,
+            )
+            if not result.success:
+                logger.warning(
+                    "[%s] deferred group finalize failed for %s "
+                    "(sentinel=%s): %s",
+                    self._log_tag, defer_chat_id, message_id, result.error,
+                )
+            return result
+
         del chat_id  # Session lookup is by logical_id, chat is implied.
 
         session = self._stream_manager.get(message_id)
