@@ -318,9 +318,34 @@ class QQAdapter(BasePlatformAdapter):
         # stream consumer calls with ``finalize=True`` — at that point
         # we deliver ONE complete reply via the normal legacy path.
         #
-        # ``sentinel_id -> {"chat_id", "chat_type", "reply_to"}``
-        # Entries are removed on finalize / drop.
+        # After the first successful ``finalize=True`` edit, the session
+        # entry is **kept but flagged as finalized** and the delivered
+        # ``SendResult`` is memoised on it.  This is intentional: the
+        # ``stream_consumer`` occasionally issues a second finalize edit
+        # after the mid-stream tick already finalized (adapters with
+        # ``REQUIRES_EDIT_FINALIZE=True`` skip the "final edit already
+        # delivered content" fast path — see the ``got_done`` branch in
+        # ``gateway/stream_consumer.py``).  Without idempotence that
+        # second call would re-enter the "session missing → recover via
+        # fresh send" branch below and post the reply a second time
+        # (the "two identical messages per group turn" bug this comment
+        # is guarding against).  We evict finalized entries only when
+        # they exceed the LRU cap to bound memory.
+        #
+        # ``sentinel_id -> {
+        #     "chat_id",
+        #     "chat_type",
+        #     "reply_to",
+        #     "finalized": bool,          # True after first finalize
+        #     "finalized_result": SendResult | None,  # memoised delivery
+        # }``
         self._group_defer_sessions: Dict[str, Dict[str, Any]] = {}
+        # LRU cap on finalized-session bookkeeping — a single QQ bot
+        # rarely holds more than a handful of concurrent group replies,
+        # so 1024 is comfortably above any realistic burst but low
+        # enough to bound memory even if some pathological consumer
+        # never issues finalize edits.
+        self._group_defer_sessions_cap: int = 1024
 
         # Connection state
         self._session: Optional[aiohttp.ClientSession] = None
@@ -2583,6 +2608,27 @@ class QQAdapter(BasePlatformAdapter):
     # How often (seconds) to poll is_connected while waiting.
     _RECONNECT_POLL_INTERVAL = 0.5
 
+    def _evict_group_defer_sessions_if_needed(self) -> None:
+        """Bound ``_group_defer_sessions`` size by dropping the oldest
+        finalized entries (LRU on insertion order) when the map exceeds
+        its cap.  Non-finalized entries are preserved — dropping one
+        would silently discard an in-flight reply and force the fallback
+        "session missing → fresh send" path.
+        """
+        cap = self._group_defer_sessions_cap
+        if len(self._group_defer_sessions) <= cap:
+            return
+        # Dicts preserve insertion order (Py 3.7+); walk oldest → newest
+        # and evict finalized entries first.  If everything is still
+        # pending we bail — capacity is best-effort, correctness wins.
+        to_drop = len(self._group_defer_sessions) - cap
+        stale_keys = [
+            k for k, v in self._group_defer_sessions.items()
+            if v.get("finalized")
+        ][:to_drop]
+        for k in stale_keys:
+            self._group_defer_sessions.pop(k, None)
+
     async def _wait_for_reconnection(self) -> bool:
         """Wait for the WebSocket listener to reconnect.
 
@@ -2673,13 +2719,22 @@ class QQAdapter(BasePlatformAdapter):
         #   4. on the final ``edit_message(finalize=True)``, send ONE
         #      complete message via the regular legacy path (which
         #      handles chunking, keyboards, retries etc. correctly).
+        #      Subsequent ``finalize=True`` edits on the same sentinel
+        #      are idempotent — the stream consumer may issue a second
+        #      finalize tick on ``REQUIRES_EDIT_FINALIZE`` adapters
+        #      (see the ``got_done`` branch in
+        #      ``gateway/stream_consumer.py``), and re-delivering the
+        #      reply would surface as duplicate messages on screen.
         if expect_edits and chat_type in ("group", "guild"):
             sentinel_id = f"__qqbot_group_defer_{uuid.uuid4().hex}__"
             self._group_defer_sessions[sentinel_id] = {
                 "chat_id": chat_id,
                 "chat_type": chat_type,
                 "reply_to": reply_to,
+                "finalized": False,
+                "finalized_result": None,
             }
+            self._evict_group_defer_sessions_if_needed()
             logger.debug(
                 "[%s] streaming first-send buffered for %s chat %s "
                 "(sentinel=%s): the complete reply will be delivered "
@@ -2912,7 +2967,11 @@ class QQAdapter(BasePlatformAdapter):
           legacy send path (chunking, keyboards, retries all handled by
           the standard ``send()``).  This collapses what would otherwise
           become two-plus messages per turn — see ``send()`` for the
-          full rationale.
+          full rationale.  A **second** ``finalize=True`` edit on the
+          same sentinel is idempotent: we memoise the delivery result
+          and replay it instead of re-sending (the stream consumer's
+          ``REQUIRES_EDIT_FINALIZE`` code path can issue a redundant
+          second finalize tick).
 
         For any other unrecognised ``message_id`` we return
         ``success=False`` so the stream consumer falls back to a fresh
@@ -2955,6 +3014,33 @@ class QQAdapter(BasePlatformAdapter):
                 # store ``content`` here — the consumer always sends
                 # the full text on every edit call, so the finalize
                 # payload is authoritative.
+                #
+                # If a previous finalize already delivered the reply,
+                # any lingering non-final edits (e.g. cancellation
+                # cleanup) are silent no-ops as well — the message is
+                # already out.
+                return SendResult(success=True, message_id=message_id)
+
+            # ``finalize=True`` re-entry guard.
+            #
+            # The stream consumer's ``got_done`` branch may issue TWO
+            # ``_send_or_edit(..., finalize=True)`` calls per turn on
+            # adapters that set ``REQUIRES_EDIT_FINALIZE=True`` — the
+            # mid-stream flush (line 742 in ``stream_consumer.py``)
+            # plus the explicit final tick right below (line 792).
+            # The first call already delivered the complete reply via
+            # ``self.send(...)``, so re-delivering here would post a
+            # second identical message ("two full events per group
+            # turn").  Idempotently return the memoised result.
+            if defer.get("finalized"):
+                logger.debug(
+                    "[%s] deferred group finalize replayed for %s "
+                    "(sentinel=%s); returning memoised result",
+                    self._log_tag, defer.get("chat_id"), message_id,
+                )
+                cached = defer.get("finalized_result")
+                if isinstance(cached, SendResult):
+                    return cached
                 return SendResult(success=True, message_id=message_id)
 
             # Finalize: deliver ONE complete reply via the legacy
@@ -2962,12 +3048,15 @@ class QQAdapter(BasePlatformAdapter):
             # at ``send()`` time so threading is preserved.
             defer_chat_id = defer.get("chat_id") or chat_id
             reply_to = defer.get("reply_to")
-            # Drop the session BEFORE the send so a re-entrant edit
-            # (shouldn't happen, but defensive) doesn't double-send.
-            self._group_defer_sessions.pop(message_id, None)
+            # Flip the flag BEFORE the send so a re-entrant edit
+            # (shouldn't happen, but defensive) hits the memoised
+            # branch above and can't double-send even if the send
+            # itself awaits at an ``await`` boundary.
+            defer["finalized"] = True
             result = await self.send(
                 defer_chat_id, content, reply_to=reply_to,
             )
+            defer["finalized_result"] = result
             if not result.success:
                 logger.warning(
                     "[%s] deferred group finalize failed for %s "

@@ -3219,6 +3219,9 @@ class TestC2CStreamingReply:
         assert session["chat_id"] == "group_a"
         assert session["chat_type"] == "group"
         assert session["reply_to"] == "inbound_m1"
+        # Fresh session — not yet finalized.
+        assert session["finalized"] is False
+        assert session["finalized_result"] is None
 
     @pytest.mark.asyncio
     async def test_guild_chat_streaming_first_send_defers_delivery(self):
@@ -3339,8 +3342,132 @@ class TestC2CStreamingReply:
         assert text.startswith("hello world, done: final answer")
         # Threaded to the original inbound message.
         assert body.get("msg_id") == "inbound_m1"
-        # Session bookkeeping cleaned up.
-        assert sentinel not in adapter._group_defer_sessions
+        # Session bookkeeping: entry is preserved but flagged so
+        # subsequent finalize edits become idempotent no-ops (see
+        # ``test_group_deferred_edit_finalize_is_idempotent``).
+        assert sentinel in adapter._group_defer_sessions
+        remembered = adapter._group_defer_sessions[sentinel]
+        assert remembered["finalized"] is True
+        assert remembered["finalized_result"] is final
+
+    @pytest.mark.asyncio
+    async def test_group_deferred_edit_finalize_is_idempotent(self):
+        """A second ``finalize=True`` edit on the same sentinel must NOT
+        re-post the reply.
+
+        Regression guard: because the adapter declares
+        ``REQUIRES_EDIT_FINALIZE=True``, the stream consumer's
+        ``got_done`` branch can issue two ``_send_or_edit(...,
+        finalize=True)`` calls per turn — the mid-stream flush plus the
+        explicit final tick.  The first call already delivered the
+        reply via ``self.send(...)``; the second must be an idempotent
+        no-op or the user sees two identical messages in the group.
+        """
+        adapter = self._make_adapter()
+        adapter._chat_type_map["group_a"] = "group"
+        calls = []
+
+        async def fake_api(method, path, body=None, **kw):
+            calls.append((method, path, body))
+            return {"id": "regular-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        first = await adapter.send(
+            "group_a", "hello",
+            reply_to="inbound_m1",
+            metadata={"expect_edits": True},
+        )
+        sentinel = first.message_id
+
+        final_a = await adapter.edit_message(
+            "group_a", sentinel, "the full reply",
+            finalize=True,
+        )
+        final_b = await adapter.edit_message(
+            "group_a", sentinel, "the full reply",
+            finalize=True,
+        )
+
+        # First finalize delivered exactly once; the second is a
+        # memoised replay — same result object, no extra API call.
+        assert len(calls) == 1
+        assert final_a.success and final_b.success
+        assert final_a.message_id == "regular-1"
+        assert final_b.message_id == "regular-1"
+        assert final_b is final_a
+
+    @pytest.mark.asyncio
+    async def test_group_deferred_edit_after_finalize_non_final_is_noop(self):
+        """A stray non-final edit arriving after finalize must not
+        re-hit QQ (would happen on cancellation cleanup or an errant
+        mid-stream tick that raced with the final one).
+        """
+        adapter = self._make_adapter()
+        adapter._chat_type_map["group_a"] = "group"
+        calls = []
+
+        async def fake_api(method, path, body=None, **kw):
+            calls.append((method, path, body))
+            return {"id": "regular-1"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        first = await adapter.send(
+            "group_a", "hi",
+            reply_to="inbound_m1",
+            metadata={"expect_edits": True},
+        )
+        sentinel = first.message_id
+
+        await adapter.edit_message("group_a", sentinel, "final",
+                                    finalize=True)
+        # Simulate a late non-final tick after finalize.
+        stray = await adapter.edit_message(
+            "group_a", sentinel, "final plus more", finalize=False,
+        )
+        assert stray.success
+        # Still exactly one API call — the finalize one.
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_group_deferred_sessions_evict_finalized_over_cap(self):
+        """The finalized-session bookkeeping must not grow without
+        bound: once above the LRU cap, oldest finalized entries are
+        dropped.  Pending (non-finalized) entries are preserved.
+        """
+        adapter = self._make_adapter()
+        adapter._chat_type_map["group_a"] = "group"
+        adapter._group_defer_sessions_cap = 3
+
+        async def fake_api(method, path, body=None, **kw):
+            return {"id": "regular"}
+
+        adapter._api_request = fake_api  # type: ignore[assignment]
+
+        # 3 finalized + 1 pending → over cap by 1.
+        finalized_ids = []
+        for _ in range(3):
+            r = await adapter.send(
+                "group_a", "hi",
+                metadata={"expect_edits": True},
+            )
+            await adapter.edit_message("group_a", r.message_id, "x",
+                                        finalize=True)
+            finalized_ids.append(r.message_id)
+
+        pending = await adapter.send(
+            "group_a", "hi",
+            metadata={"expect_edits": True},
+        )
+
+        # Cap enforcement runs on send() insertion — the oldest
+        # finalized entry should have been evicted, the pending one
+        # kept.
+        assert pending.message_id in adapter._group_defer_sessions
+        assert finalized_ids[0] not in adapter._group_defer_sessions
+        # Newer finalized entries remain until they too age out.
+        assert finalized_ids[-1] in adapter._group_defer_sessions
 
     @pytest.mark.asyncio
     async def test_group_deferred_edit_after_session_expiry_recovers(self):
