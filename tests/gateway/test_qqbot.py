@@ -2764,6 +2764,34 @@ class TestGroupContextBuffer:
         from gateway.platforms.qqbot.group_context import GroupContextBuffer
         assert GroupContextBuffer.format_context([], "just this") == "just this"
 
+    def test_format_context_block_no_current_message(self):
+        # The block variant renders context only (for channel_context): it must
+        # include the CONTEXT-ONLY header + entries, but NOT the current message
+        # and NOT the CURRENT-MESSAGE end tag (gateway supplies [New message]).
+        from gateway.platforms.qqbot.group_context import (
+            GroupContextBuffer, HistoryEntry, HISTORY_CTX_START, HISTORY_CTX_END,
+        )
+        entries = [HistoryEntry(sender="u1", text="hello"),
+                   HistoryEntry(sender="u2", text="world")]
+        out = GroupContextBuffer.format_context_block(entries)
+        assert HISTORY_CTX_START in out
+        assert "u1: hello" in out
+        assert "u2: world" in out
+        assert HISTORY_CTX_END not in out
+
+    def test_format_context_block_empty_returns_blank(self):
+        from gateway.platforms.qqbot.group_context import GroupContextBuffer
+        assert GroupContextBuffer.format_context_block([]) == ""
+
+    def test_format_context_block_collapses_newlines(self):
+        # R5 hardening: a buffered multi-line message cannot forge envelope tags.
+        from gateway.platforms.qqbot.group_context import (
+            GroupContextBuffer, HistoryEntry,
+        )
+        entries = [HistoryEntry(sender="u1", text="line1\nline2")]
+        out = GroupContextBuffer.format_context_block(entries)
+        assert "u1: line1 line2" in out
+
     def test_summarize_attachments(self):
         from gateway.platforms.qqbot.group_context import summarize_attachments
         assert summarize_attachments(None) == ""
@@ -2823,10 +2851,38 @@ class TestGroupContextIntegration:
             "GROUP_AT_MESSAGE_CREATE",
         )
         assert len(captured) == 1
-        text = captured[0].text
-        assert "CONTEXT ONLY" in text
-        assert "alice: the sky is blue" in text
-        assert text.endswith("what did she say")
+        # Buffered history is carried in channel_context (kept out of text so
+        # slash-command detection + sender-prefix operate on the trigger alone).
+        ctx = captured[0].channel_context
+        assert ctx and "CONTEXT ONLY" in ctx
+        assert "alice: the sky is blue" in ctx
+        # text is the trigger message only.
+        assert captured[0].text == "what did she say"
+
+    @pytest.mark.asyncio
+    async def test_command_at_message_stays_matchable_with_pending_context(self):
+        # Regression: a /stop-style command in an @-message must remain at the
+        # start of text (get_command works) even when pending context exists;
+        # the context goes to channel_context instead of being merged ahead.
+        adapter = self._make_adapter()
+        captured = self._drive(adapter)
+        await adapter._handle_group_message(
+            {"group_openid": "g1", "content": "the sky is blue"}, "m1",
+            "the sky is blue", {"member_openid": "alice"}, "",
+            "GROUP_MESSAGE_CREATE",
+        )
+        await adapter._handle_group_message(
+            {"group_openid": "g1", "content": "/stop"}, "m2",
+            "/stop", {"member_openid": "bob"}, "",
+            "GROUP_AT_MESSAGE_CREATE",
+        )
+        assert len(captured) == 1
+        ev = captured[0]
+        assert ev.text == "/stop"
+        assert ev.is_command() is True
+        assert ev.get_command() == "stop"
+        # context preserved separately, not merged into text.
+        assert ev.channel_context and "alice: the sky is blue" in ev.channel_context
 
     @pytest.mark.asyncio
     async def test_buffer_cleared_after_injection(self):
@@ -2894,7 +2950,12 @@ class TestGroupContextIntegration:
             {"member_openid": "bob"}, "", "GROUP_AT_MESSAGE_CREATE",
         )
         assert len(captured) == 1
-        assert "alice: background note" in captured[0].text
+        # bare @ carries no trigger body; pending context lands in channel_context.
+        assert captured[0].text == ""
+        assert (
+            captured[0].channel_context
+            and "alice: background note" in captured[0].channel_context
+        )
         # buffer cleared.
         assert adapter._group_context.drain("g1") == []
 
@@ -2922,10 +2983,13 @@ class TestGroupContextIntegration:
             "see attached", {"member_openid": "bob"}, "",
             "GROUP_AT_MESSAGE_CREATE",
         )
-        text = captured[0].text
-        assert text.index("earlier") < text.index("see attached")
-        assert text.index("see attached") < text.index("[file: doc.pdf]")
-        assert "CONTEXT ONLY" in text
+        ev = captured[0]
+        # Trigger message + its attachment_info stay in text, in order.
+        assert ev.text.index("see attached") < ev.text.index("[file: doc.pdf]")
+        # Buffered history is separated into channel_context.
+        assert ev.channel_context and "CONTEXT ONLY" in ev.channel_context
+        assert "earlier" in ev.channel_context
+        assert "earlier" not in ev.text
 
 
 # ---------------------------------------------------------------------------

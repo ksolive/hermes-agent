@@ -1536,16 +1536,26 @@ class QQAdapter(BasePlatformAdapter):
             image_urls = image_urls + quoted["image_urls"]
             image_media_types = image_media_types + quoted["image_media_types"]
 
-        # (6) mention-mode @-activation: prepend any buffered non-@ messages as
-        # CONTEXT ONLY, then clear the group's buffer (2.2.1). Done BEFORE the
-        # empty check so an @-message with no body (e.g. a bare @) still flushes
-        # and injects the pending context. In always mode the buffer is empty
+        # (6) mention-mode @-activation: drain any buffered non-@ messages and
+        # carry them as CONTEXT ONLY via ``channel_context`` — NOT merged into
+        # ``text``. Keeping the buffered history out of ``text`` leaves the
+        # trigger message at the start of ``text`` so slash-command detection
+        # (event.get_command) and sender-prefix logic in run.py operate on the
+        # current message alone; run.py prepends channel_context afterwards.
+        # This fixes ``/stop``-style commands failing to match in mention/context
+        # modes where the buffered block previously sat ahead of the command.
+        # Done BEFORE the empty check so a bare @ (no body) still flushes and
+        # injects the pending context. In always mode the buffer is empty
         # (nothing was recorded), so drain is a harmless no-op.
         pending = self._group_context.drain(group_openid)
-        if pending:
-            text = GroupContextBuffer.format_context(pending, text)
+        channel_context = (
+            GroupContextBuffer.format_context_block(pending) if pending else None
+        )
 
-        if not text.strip() and not image_urls:
+        # An empty trigger with no media is normally dropped, but a bare @ that
+        # flushes pending context must still produce a turn — otherwise the
+        # buffered context would be stranded.
+        if not text.strip() and not image_urls and not channel_context:
             return
 
         self._chat_type_map[group_openid] = "group"
@@ -1556,6 +1566,7 @@ class QQAdapter(BasePlatformAdapter):
                 chat_type="group",
             ),
             text=text,
+            channel_context=channel_context,
             message_type=self._detect_message_type(image_urls, image_media_types),
             raw_message=d,
             message_id=msg_id,
